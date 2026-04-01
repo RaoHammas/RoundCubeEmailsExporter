@@ -22,6 +22,7 @@ import logging
 import re
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 import yaml
@@ -678,11 +679,34 @@ class RoundCubeExporter:
     # ── Navigate to the target mailbox ─────────────────────────────────────
 
     def _go_to_mailbox(self, page):
-        # Refresh self.url from the live page URL before navigating so that
-        # a rotated cPanel session token (cpsessXXXXXXXXXX) never causes a
-        # 404.  self.url may be stale if the user spent time at an interactive
-        # prompt (e.g. the "Press Enter to begin" prompt at the end of the
-        # setup wizard).
+        # The setup wizard always ends with the browser on the inbox page and
+        # all message rows already loaded.  Doing a second page.goto() here
+        # would trigger a full page reload: RoundCube re-fetches the message
+        # list via an asynchronous AJAX request that can fire *after*
+        # networkidle is reached, so the rows would not be in the DOM when
+        # _export_all_pages first queries them.
+        #
+        # Skip navigation when:
+        #   • we are starting at page 1 (the default), AND
+        #   • the browser is already showing _task=mail for the target mailbox.
+        #
+        # We still navigate when start_page > 1 (need to jump to a specific
+        # page) or when the browser is on a different mailbox / view.
+        if self.start_page == 1:
+            parsed = urllib.parse.urlparse(page.url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            if (
+                qs.get("_task") == ["mail"]
+                and qs.get("_mbox") == [self.mailbox]
+            ):
+                log.info(
+                    "Already on mailbox '%s' at page 1 – skipping navigation.",
+                    self.mailbox,
+                )
+                return
+
+        # Refresh self.url from the live page URL so that a rotated cPanel
+        # session token (cpsessXXXXXXXXXX) never causes a 404.
         if "/roundcube" in page.url.lower():
             self.url = page.url.split("?")[0].rstrip("/")
         target = f"{self.url}?_task=mail&_mbox={self.mailbox}"
