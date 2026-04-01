@@ -678,6 +678,13 @@ class RoundCubeExporter:
     # ── Navigate to the target mailbox ─────────────────────────────────────
 
     def _go_to_mailbox(self, page):
+        # Refresh self.url from the live page URL before navigating so that
+        # a rotated cPanel session token (cpsessXXXXXXXXXX) never causes a
+        # 404.  self.url may be stale if the user spent time at an interactive
+        # prompt (e.g. the "Press Enter to begin" prompt at the end of the
+        # setup wizard).
+        if "/roundcube" in page.url.lower():
+            self.url = page.url.split("?")[0].rstrip("/")
         target = f"{self.url}?_task=mail&_mbox={self.mailbox}"
         if self.start_page > 1:
             target += f"&_page={self.start_page}"
