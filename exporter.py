@@ -830,8 +830,10 @@ class RoundCubeExporter:
                 # Collect UID / URL info for every row, open them in tabs that
                 # load simultaneously in the browser, then trigger exports one
                 # by one (UI interaction is sequential but network I/O is not).
+                # Rows whose UID cannot be determined are exported via the
+                # serial fallback inside _export_page_with_tabs.
                 messages = self._collect_page_messages(rows, current_page)
-                self._export_page_with_tabs(messages)
+                self._export_page_with_tabs(page, rows, messages, current_page)
             else:
                 # ── Serial mode (original behaviour) ──────────────────────
                 # Export each message; re-query the DOM after each click
@@ -868,25 +870,64 @@ class RoundCubeExporter:
     def _get_row_uid(row) -> str:
         """Extract the RoundCube message UID from a message-list row element.
 
-        RoundCube exposes the UID via the ``data-uid`` attribute in modern
-        versions, and via ``id="rcmrow{uid}"`` in older ones.
+        Different RoundCube versions and themes store the UID in different
+        places.  This method performs a comprehensive search using JavaScript
+        so it works across all known variants:
+
+        1. ``data-uid`` attribute on the ``<tr>`` (modern RoundCube)
+        2. ``id="rcmrow{uid}"`` on the ``<tr>`` (older RoundCube)
+        3. ``data-id`` attribute on the ``<tr>`` (some themes)
+        4. ``<input name="uid[]">`` or ``<input name*="uid">`` child element
+        5. Any ``href`` on a child ``<a>`` that contains ``_uid=``
+        6. Any ``data-*`` attribute whose name includes the word "uid"
         """
-        uid = row.get_attribute("data-uid") or ""
-        if uid.strip():
-            return uid.strip()
-        row_id = row.get_attribute("id") or ""
-        m = re.match(r"rcmrow(.+)", row_id, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-        return ""
+        try:
+            uid = row.evaluate(r"""el => {
+                // 1. data-uid on the row
+                var v = el.getAttribute('data-uid');
+                if (v && v.trim()) return v.trim();
+                // 2. id="rcmrow{uid}"
+                var id = el.getAttribute('id') || '';
+                var m = id.match(/^rcmrow(.+)$/i);
+                if (m) return m[1].trim();
+                // 3. data-id on the row
+                v = el.getAttribute('data-id');
+                if (v && v.trim()) return v.trim();
+                // 4. child checkbox / hidden input whose name involves uid
+                var inp = el.querySelector(
+                    'input[name="uid[]"], input[name*="uid"], input[value][name*="id"]'
+                );
+                if (inp && inp.value && inp.value.trim()) return inp.value.trim();
+                // 5. any child link whose href contains _uid=
+                var links = el.querySelectorAll('a[href]');
+                for (var i = 0; i < links.length; i++) {
+                    var href = links[i].getAttribute('href') || '';
+                    var um = href.match(/_uid=([^&]+)/);
+                    if (um) return decodeURIComponent(um[1]);
+                }
+                // 6. any data-* attribute on the row whose name contains "uid"
+                var attrs = el.attributes;
+                for (var j = 0; j < attrs.length; j++) {
+                    if (attrs[j].name.toLowerCase().indexOf('uid') !== -1
+                            && attrs[j].value.trim()) {
+                        return attrs[j].value.trim();
+                    }
+                }
+                return '';
+            }""")
+            return str(uid).strip() if uid else ""
+        except Exception:
+            return ""
 
     def _collect_page_messages(self, rows, page_num: int) -> list:
         """Return a list of message-info dicts for every row on the current page.
 
         Each dict contains:
-          label  – human-readable filename prefix (page / msg / subject)
-          uid    – RoundCube message UID (empty string if unavailable)
-          url    – direct URL to open the message in a new tab (empty if no UID)
+          label    – human-readable filename prefix (page / msg / subject)
+          uid      – RoundCube message UID (empty string if unavailable)
+          url      – direct URL to open the message in a new tab (empty if no UID)
+          row_idx  – 0-based index of the row in the ``rows`` list (used for
+                     the serial fallback when no URL is available)
         """
         messages = []
         for idx, row in enumerate(rows):
@@ -907,10 +948,10 @@ class RoundCubeExporter:
                     f"{self.url}?_task=mail&_action=show"
                     f"&_uid={uid}&_mbox={urllib.parse.quote(self.mailbox)}"
                 )
-            messages.append({"uid": uid, "label": label, "url": url})
+            messages.append({"uid": uid, "label": label, "url": url, "row_idx": idx})
         return messages
 
-    def _export_page_with_tabs(self, messages: list):
+    def _export_page_with_tabs(self, page, rows: list, messages: list, current_page: int):
         """Export all messages on one inbox page using parallel browser tabs.
 
         Messages are processed in batches of ``self.parallel_tabs``.  Within
@@ -933,6 +974,25 @@ class RoundCubeExporter:
            very fast.
 
         4. **Close phase** – close every tab in the batch.
+
+        Any message for which a direct URL could not be built (no UID found in
+        the row) is exported via the regular serial ``_export_single`` path so
+        that no email is ever silently skipped.
+
+        Parameters
+        ----------
+        page:
+            The main browser page (still showing the inbox message list).
+            Used as the fallback page for rows whose UID cannot be determined.
+        rows:
+            The list of Playwright ``ElementHandle`` objects for all message
+            rows on the current inbox page.  Must align 1-to-1 with
+            ``messages`` (same order, same length).
+        messages:
+            Message-info dicts produced by ``_collect_page_messages``.
+        current_page:
+            The 1-based inbox page number, used for building filenames and
+            for the serial fallback call to ``_export_single``.
         """
         for batch_start in range(0, len(messages), self.parallel_tabs):
             batch = messages[batch_start: batch_start + self.parallel_tabs]
@@ -941,12 +1001,22 @@ class RoundCubeExporter:
             tabs_data = []
             for msg in batch:
                 if not msg["url"]:
-                    log.warning(
-                        "  ✗ Cannot determine direct URL for [%s] – no UID found."
-                        " Skipping (try serial mode with --parallel-tabs 1).",
-                        msg["label"],
-                    )
-                    self.failed += 1
+                    # UID not found – fall back to the serial single-page export
+                    # so the email is still captured rather than silently skipped.
+                    row_idx = msg["row_idx"]
+                    row = rows[row_idx] if row_idx < len(rows) else None
+                    if row is not None:
+                        log.warning(
+                            "  UID not found for [%s] – falling back to serial export.",
+                            msg["label"],
+                        )
+                        self._export_single(page, row, current_page, row_idx + 1)
+                    else:
+                        log.warning(
+                            "  ✗ Cannot export [%s] – no UID and row not accessible.",
+                            msg["label"],
+                        )
+                        self.failed += 1
                     continue
                 try:
                     tab = self.context.new_page()
