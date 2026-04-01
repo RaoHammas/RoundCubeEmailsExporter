@@ -1,0 +1,21 @@
+# Credentials & personal config – never commit these
+config.yaml
+
+# Export output
+exported_emails/
+
+# Log file
+exporter.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Playwright browser binaries
+.playwright/

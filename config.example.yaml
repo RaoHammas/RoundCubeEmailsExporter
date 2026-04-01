@@ -1,0 +1,29 @@
+# RoundCube Emails Exporter – example configuration
+# Copy this file to config.yaml, fill in your details, then run:
+#   python exporter.py --config config.yaml
+
+# ── Required ────────────────────────────────────────────────────────────────
+
+# Base URL of your RoundCube installation (include trailing slash)
+url: "https://yourserver.com/roundcube/"
+
+# Your RoundCube login credentials
+username: "user@example.com"
+password: "yourpassword"
+
+# ── Optional ─────────────────────────────────────────────────────────────────
+
+# Directory where exported .eml files will be saved
+download_dir: "./exported_emails"
+
+# Mailbox / folder to export (INBOX, Sent, Drafts, Junk, Trash, or a custom folder name)
+mailbox: "INBOX"
+
+# Run the browser without a visible window (true = headless, false = show browser)
+headless: false
+
+# Seconds to wait between actions – increase if your server is slow
+delay: 1.0
+
+# Page number to start from (useful for resuming an interrupted run)
+start_page: 1
