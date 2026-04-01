@@ -203,9 +203,7 @@ class RoundCubeExporter:
             # Update base URL to the actual RoundCube location so that
             # subsequent navigation (e.g. _go_to_mailbox) uses the
             # correct origin after any cPanel redirects.
-            current = page.url
-            if "?" in current:
-                current = current[: current.index("?")]
+            current = page.url.split("?")[0]
             self.url = current.rstrip("/")
             log.info("RoundCube base URL set to %s", self.url)
 
