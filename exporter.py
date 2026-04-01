@@ -305,6 +305,8 @@ class RoundCubeExporter:
     def run(self):
         """Launch the browser and export all emails."""
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        abs_download_dir = self.download_dir.resolve()
+        log.info("Downloads will be saved to: %s", abs_download_dir)
 
         if self.headless:
             log.warning(
@@ -322,6 +324,10 @@ class RoundCubeExporter:
                 str(PROFILE_DIR),
                 headless=False,
                 accept_downloads=True,
+                # Stage Playwright's temp download files inside download_dir so
+                # that Chrome's downloads page (chrome://downloads) points to
+                # the right folder and the "Show in folder" button works.
+                downloads_path=str(abs_download_dir),
                 viewport={"width": 1400, "height": 900},
             )
             page = context.pages[0] if context.pages else context.new_page()
