@@ -536,7 +536,18 @@ class RoundCubeExporter:
         The wizard navigates the browser through the states needed to expose
         each element (opening a sample message, opening the More dropdown, …)
         and ends with a final Enter-to-start prompt.
+
+        **Important**: the inbox URL is captured at the very start of the
+        wizard so that step 4 navigates back to the *exact* URL the browser
+        is currently on (including any live cPanel session token).  This
+        avoids a 404 that would occur if we reconstructed the URL from the
+        ``self.url`` value that was stored at login time and whose cPanel
+        ``cpsess`` token may have since been refreshed by the server.
         """
+        # Snapshot the live inbox URL before any navigation so we can return
+        # to it reliably even if the cPanel session token has been refreshed.
+        inbox_url = page.url
+
         print(
             "\n"
             "  ════════════════════════════════════════════════════════\n"
@@ -625,12 +636,16 @@ class RoundCubeExporter:
             time.sleep(0.2)
 
         # ── 4. next_page – navigate back to inbox to check pagination ─────────
+        # Use the live URL captured before any wizard navigation (not the
+        # reconstructed self.url) so a refreshed cPanel session token does
+        # not cause a 404 page instead of the real inbox.
         try:
-            page.goto(
-                f"{self.url}?_task=mail&_mbox={self.mailbox}",
-                wait_until="networkidle",
-            )
+            page.goto(inbox_url, wait_until="networkidle")
             time.sleep(self.delay)
+            # Keep self.url in sync with the current live session token so
+            # that _go_to_mailbox (called right after the wizard) also works.
+            if "/roundcube" in page.url.lower():
+                self.url = page.url.split("?")[0].rstrip("/")
         except Exception:
             pass
 
