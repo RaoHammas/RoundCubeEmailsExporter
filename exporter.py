@@ -184,10 +184,11 @@ class RoundCubeExporter:
     def _wait_for_manual_login(self, page):
         """Open the browser at self.url and wait for the user to log in.
 
-        Export starts only after the browser URL contains 'roundcube',
+        Export starts only after the browser URL contains '/roundcube',
         which indicates that the user has successfully authenticated and
         reached the RoundCube webmail application.  The script waits up
-        to 5 minutes before giving up.
+        to 5 minutes for the URL to change, then asks the user to press
+        Enter before the actual export begins.
         """
         log.info("Opening %s", self.url)
         page.goto(self.url, wait_until="networkidle")
@@ -206,12 +207,24 @@ class RoundCubeExporter:
                 re.compile(r"/roundcube", re.IGNORECASE),
                 timeout=LOGIN_TIMEOUT_MS,
             )
-            log.info("RoundCube detected in URL – starting export …")
+            log.info("RoundCube detected in URL.")
 
         # Capture the RoundCube base URL (strip query string so that
         # _go_to_mailbox can append its own parameters).
         self.url = page.url.split("?")[0].rstrip("/")
         log.info("RoundCube base URL set to %s", self.url)
+
+        # Give the user a chance to confirm the page is fully ready before
+        # the automated export starts (e.g. let slow pages finish loading,
+        # or navigate to a specific folder first).
+        input(
+            "\n"
+            "  ============================================================\n"
+            "  Browser is on the RoundCube page.  Make sure the inbox (or\n"
+            "  the folder you want to export) is fully loaded, then press\n"
+            "  Enter here to start the export …\n"
+            "  ============================================================\n"
+        )
 
     # ── Navigate to the target mailbox ─────────────────────────────────────
 

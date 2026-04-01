@@ -38,9 +38,11 @@ playwright install chromium
 python exporter.py --url "https://yourserver.com:2096/"
 ```
 
-A browser window will open.  **Log in manually.**  As soon as the URL
-contains `roundcube` (e.g. `…/3rdparty/roundcube/?_task=mail&_mbox=INBOX`),
-the script detects it and begins exporting automatically.
+A browser window will open.  **Log in manually.**  Once the URL contains
+`roundcube` (e.g. `…/3rdparty/roundcube/?_task=mail&_mbox=INBOX`), the script
+detects it and pauses.  **Press Enter in the terminal** when the inbox (or
+the folder you want to export) is fully loaded — the export then starts
+automatically.
 
 ### Option B – config file
 
@@ -99,7 +101,8 @@ A log file `exporter.log` is also written in the current directory.
 ## How it works
 
 ```
-Open browser → wait for manual login (URL must contain 'roundcube')
+Open browser → wait for manual login (URL must contain '/roundcube')
+  → press Enter in terminal to confirm page is ready
   └─ For each page:
        ├─ For each email row in the message list:
        │    ├─ Click the row  (opens the message preview)
