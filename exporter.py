@@ -45,10 +45,18 @@ log = logging.getLogger(__name__)
 # Adjust these if your RoundCube version uses different class/id names.
 # ---------------------------------------------------------------------------
 SELECTORS = {
-    # ── Login form ──────────────────────────────────────────────────────────
+    # ── RoundCube login form ────────────────────────────────────────────────
     "login_user":   "#rcmloginuser",
     "login_pass":   "#rcmloginpwd",
     "login_submit": "#rcmloginsubmit",
+
+    # ── cPanel webmail login form (port 2096 / 2095) ───────────────────────
+    "cpanel_user":   "#user",
+    "cpanel_pass":   "#pass",
+    "cpanel_submit": "#login_submit",
+
+    # ── cPanel webmail client selection page (after cPanel login) ──────────
+    "cpanel_roundcube_link": 'a[href*="roundcube"]',
 
     # ── Message list rows ───────────────────────────────────────────────────
     # RoundCube renders the inbox as a <table id="messagelist"> where every
@@ -174,13 +182,43 @@ class RoundCubeExporter:
         log.info("Opening %s", self.url)
         page.goto(self.url, wait_until="networkidle")
 
-        if page.query_selector(SELECTORS["login_user"]):
+        # ── Try cPanel webmail login (port 2096 / 2095) ────────────────────
+        if page.query_selector(SELECTORS["cpanel_user"]):
+            log.info("Detected cPanel webmail login page")
+            log.info("Logging in as '%s' …", self.username)
+            page.fill(SELECTORS["cpanel_user"], self.username)
+            page.fill(SELECTORS["cpanel_pass"], self.password)
+            page.click(SELECTORS["cpanel_submit"])
+            page.wait_for_load_state("networkidle")
+            log.info("cPanel login successful")
+
+            # After cPanel login a webmail-client selection page may appear;
+            # automatically click the RoundCube link if present.
+            rc_link = page.query_selector(SELECTORS["cpanel_roundcube_link"])
+            if rc_link:
+                log.info("Webmail selection page detected – choosing RoundCube …")
+                rc_link.click()
+                page.wait_for_load_state("networkidle")
+
+            # Update base URL to the actual RoundCube location so that
+            # subsequent navigation (e.g. _go_to_mailbox) uses the
+            # correct origin after any cPanel redirects.
+            current = page.url
+            if "?" in current:
+                current = current[: current.index("?")]
+            self.url = current.rstrip("/")
+            log.info("RoundCube base URL set to %s", self.url)
+
+        # ── Try native RoundCube login ─────────────────────────────────────
+        elif page.query_selector(SELECTORS["login_user"]):
+            log.info("Detected RoundCube login page")
             log.info("Logging in as '%s' …", self.username)
             page.fill(SELECTORS["login_user"], self.username)
             page.fill(SELECTORS["login_pass"], self.password)
             page.click(SELECTORS["login_submit"])
             page.wait_for_load_state("networkidle")
             log.info("Login successful")
+
         else:
             log.info("Login form not present – assuming session already active")
 

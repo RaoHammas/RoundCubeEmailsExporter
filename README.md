@@ -41,6 +41,17 @@ python exporter.py \
   --password "yourpassword"
 ```
 
+The `--url` also accepts **cPanel webmail** URLs (port 2096 or 2095).
+The script will automatically log in via cPanel, select RoundCube if a
+webmail-client selection page appears, and then export emails as usual:
+
+```bash
+python exporter.py \
+  --url      "https://yourserver.com:2096" \
+  --username "user@example.com" \
+  --password "yourpassword"
+```
+
 ### Option B – config file
 
 Copy the example config, fill in your details, then run:
@@ -55,7 +66,7 @@ python exporter.py --config config.yaml
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--url` | *(required)* | RoundCube base URL |
+| `--url` | *(required)* | RoundCube base URL (also works with cPanel webmail URLs on port 2096/2095) |
 | `--username` | *(required)* | Login username / email address |
 | `--password` | *(required)* | Login password |
 | `--download-dir` | `./exported_emails` | Folder to save `.eml` files |
