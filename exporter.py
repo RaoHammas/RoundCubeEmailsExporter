@@ -301,6 +301,8 @@ class RoundCubeExporter:
         self.headless = headless
         self.delay = delay
         self.start_page = start_page
+        # Cap at 30 to avoid excessive browser memory usage and OS file-descriptor
+        # limits; beyond ~10 tabs the marginal speed gain is negligible.
         self.parallel_tabs = max(1, min(int(parallel_tabs), 30))
         self.exported = 0
         self.failed = 0
@@ -827,13 +829,12 @@ class RoundCubeExporter:
 
             if self.parallel_tabs > 1 and self.context is not None:
                 # ── Parallel-tab mode ──────────────────────────────────────
-                # Collect UID / URL info for every row, open them in tabs that
-                # load simultaneously in the browser, then trigger exports one
-                # by one (UI interaction is sequential but network I/O is not).
-                # Rows whose UID cannot be determined are exported via the
-                # serial fallback inside _export_page_with_tabs.
-                messages = self._collect_page_messages(rows, current_page)
-                self._export_page_with_tabs(page, rows, messages, current_page)
+                # Open each message in its own tab using native browser
+                # gestures (Ctrl+click → window.open → new_page fallback),
+                # trigger More→Export on each tab, save, then close tabs.
+                # Rows for which no tab could be opened are handled by the
+                # serial _export_single fallback inside _export_page_with_tabs.
+                self._export_page_with_tabs(page, rows, current_page)
             else:
                 # ── Serial mode (original behaviour) ──────────────────────
                 # Export each message; re-query the DOM after each click
@@ -951,98 +952,148 @@ class RoundCubeExporter:
             messages.append({"uid": uid, "label": label, "url": url, "row_idx": idx})
         return messages
 
-    def _export_page_with_tabs(self, page, rows: list, messages: list, current_page: int):
+    def _open_row_in_new_tab(self, page, row, label: str):
+        """Open a message row in a new browser tab using native gestures.
+
+        Three strategies are attempted in order, stopping at the first
+        one that successfully produces an open tab:
+
+        1. **Ctrl+click the row** – RoundCube's built-in "Open in New Tab"
+           gesture.  No UID or URL construction required; RoundCube itself
+           builds the correct URL and opens the message just as a human would
+           by pressing Ctrl and clicking.
+
+        2. **``window.open(url, '_blank')``** executed from the inbox page –
+           requires a UID but runs inside the browser context of the inbox
+           tab, so all session state and cookies are fully inherited by the
+           new tab.
+
+        3. **``context.new_page().goto(url)``** – creates a fresh tab and
+           navigates directly.  Used only when the first two strategies fail.
+
+        Returns the Playwright ``Page`` object for the newly opened tab on
+        success, or ``None`` when every strategy fails.
+        """
+        # ── Strategy 1: Ctrl+click (native RoundCube "Open in New Tab") ─────
+        try:
+            with self.context.expect_page(timeout=4_000) as page_info:
+                row.click(modifiers=["Control"])
+            tab = page_info.value
+            tab.wait_for_load_state("domcontentloaded", timeout=30_000)
+            return tab
+        except Exception:
+            pass
+
+        # ── Strategy 2: window.open() from the inbox page ───────────────────
+        uid = self._get_row_uid(row)
+        if uid:
+            url = (
+                f"{self.url}?_task=mail&_action=show"
+                f"&_uid={uid}&_mbox={urllib.parse.quote(self.mailbox)}"
+            )
+            try:
+                with self.context.expect_page(timeout=5_000) as page_info:
+                    page.evaluate("url => window.open(url, '_blank')", url)
+                tab = page_info.value
+                tab.wait_for_load_state("domcontentloaded", timeout=30_000)
+                return tab
+            except Exception:
+                pass
+
+            # ── Strategy 3: direct new_page().goto() ─────────────────────────
+            try:
+                tab = self.context.new_page()
+                tab.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                return tab
+            except Exception as exc:
+                log.warning(
+                    "  ✗ All tab-open strategies failed for [%s]: %s", label, exc
+                )
+                try:
+                    tab.close()
+                except Exception:
+                    pass
+
+        return None
+
+    def _export_page_with_tabs(self, page, rows: list, current_page: int):
         """Export all messages on one inbox page using parallel browser tabs.
 
-        Messages are processed in batches of ``self.parallel_tabs``.  Within
-        each batch:
+        For each batch of ``self.parallel_tabs`` rows the method runs four
+        phases:
 
-        1. **Open phase** – every tab is navigated to its direct message URL
-           with ``wait_until="commit"`` so Python returns as soon as the HTTP
-           response starts.  The browser continues loading each tab's content
-           in the background while we open the next one.
+        1. **Open phase** – each message is opened in its own browser tab via
+           :meth:`_open_row_in_new_tab`, which tries native gestures first
+           (Ctrl+click, then ``window.open()``) before falling back to direct
+           navigation.  Rows for which no tab can be opened are exported
+           immediately via the serial :meth:`_export_single` fallback so that
+           no email is ever silently skipped.
 
-        2. **Export phase** – iterate through the open tabs sequentially.  By
-           the time we reach each tab it is typically already at networkidle
-           (loaded while we were opening later tabs), so the per-tab wait is
-           near zero.  We open the More dropdown, click Export, and collect the
-           Playwright Download handle without waiting for the file to finish.
+        2. **Export phase** – iterates the open tabs sequentially and triggers
+           More→Export on each.  Because loading started during the Open phase,
+           most tabs are already at network-idle by the time we reach them.
 
-        3. **Save phase** – call ``save_as()`` for every collected download.
-           Because all tabs triggered their downloads during the export phase,
-           most (or all) files are already fully transferred, so this phase is
-           very fast.
+        3. **Save phase** – calls ``save_as()`` for every collected download.
 
-        4. **Close phase** – close every tab in the batch.
-
-        Any message for which a direct URL could not be built (no UID found in
-        the row) is exported via the regular serial ``_export_single`` path so
-        that no email is ever silently skipped.
+        4. **Close phase** – closes every tab opened in this batch, returning
+           focus to the main inbox page for the next batch or the page-advance
+           step.
 
         Parameters
         ----------
         page:
-            The main browser page (still showing the inbox message list).
-            Used as the fallback page for rows whose UID cannot be determined.
+            The main browser page showing the inbox message list.
         rows:
-            The list of Playwright ``ElementHandle`` objects for all message
-            rows on the current inbox page.  Must align 1-to-1 with
-            ``messages`` (same order, same length).
-        messages:
-            Message-info dicts produced by ``_collect_page_messages``.
+            Playwright ``ElementHandle`` objects for every message row on the
+            current inbox page (as returned by ``query_selector_all``).
         current_page:
-            The 1-based inbox page number, used for building filenames and
-            for the serial fallback call to ``_export_single``.
+            1-based inbox page number used for constructing file-name labels.
         """
-        for batch_start in range(0, len(messages), self.parallel_tabs):
-            batch = messages[batch_start: batch_start + self.parallel_tabs]
+        for batch_start in range(0, len(rows), self.parallel_tabs):
+            batch_rows = rows[batch_start: batch_start + self.parallel_tabs]
 
-            # ── Phase 1: open tabs (they load in parallel at the browser level)
+            # Build human-readable labels for filenames
+            batch_labels = []
+            for idx, row in enumerate(batch_rows):
+                global_idx = batch_start + idx
+                subject = ""
+                subject_el = row.query_selector("td.subject, .subject, span.subject")
+                if subject_el:
+                    try:
+                        subject = sanitize_filename(subject_el.inner_text().strip())
+                    except Exception:
+                        pass
+                label = f"page{current_page:04d}_msg{global_idx + 1:04d}"
+                if subject:
+                    label = f"{label}_{subject}"
+                batch_labels.append(label)
+
+            # ── Phase 1: open each row in its own tab ────────────────────────
             tabs_data = []
-            for msg in batch:
-                if not msg["url"]:
-                    # UID not found – fall back to the serial single-page export
-                    # so the email is still captured rather than silently skipped.
-                    row_idx = msg["row_idx"]
-                    row = rows[row_idx] if row_idx < len(rows) else None
-                    if row is not None:
-                        log.warning(
-                            "  UID not found for [%s] – falling back to serial export.",
-                            msg["label"],
-                        )
-                        self._export_single(page, row, current_page, row_idx + 1)
-                    else:
-                        log.warning(
-                            "  ✗ Cannot export [%s] – no UID and row not accessible.",
-                            msg["label"],
-                        )
-                        self.failed += 1
-                    continue
-                try:
-                    tab = self.context.new_page()
-                    # "commit" = return as soon as the HTTP response arrives;
-                    # the page keeps loading in background while we open the
-                    # next tab, achieving true parallel loading.
-                    tab.goto(msg["url"], wait_until="commit", timeout=30_000)
-                    tabs_data.append((tab, msg))
-                    log.info("  ↗ Tab opened for [%s]", msg["label"])
-                except Exception as exc:
+            for batch_idx, (row, label) in enumerate(zip(batch_rows, batch_labels)):
+                global_idx = batch_start + batch_idx
+                tab = self._open_row_in_new_tab(page, row, label)
+                if tab is not None:
+                    tabs_data.append((tab, label))
+                    log.info("  ↗ Tab opened for [%s]", label)
+                else:
                     log.warning(
-                        "  ✗ Could not open tab for [%s]: %s", msg["label"], exc
+                        "  ✗ Could not open new tab for [%s] – falling back to serial.",
+                        label,
                     )
-                    self.failed += 1
+                    self._export_single(page, row, current_page, global_idx + 1)
 
-            # ── Phase 2: trigger exports (tabs load while we iterate)
+            # ── Phase 2: trigger exports (tabs load while we iterate) ────────
             pending_downloads = []
-            for tab, msg in tabs_data:
-                dl = self._trigger_tab_export(tab, msg["label"])
+            for tab, label in tabs_data:
+                dl = self._trigger_tab_export(tab, label)
                 if dl is not None:
-                    dest = self.download_dir / f"{msg['label']}.eml"
-                    pending_downloads.append((dl, dest, msg["label"]))
+                    dest = self.download_dir / f"{label}.eml"
+                    pending_downloads.append((dl, dest, label))
                 else:
                     self.failed += 1
 
-            # ── Phase 3: save downloads (most already finished in background)
+            # ── Phase 3: save downloads (most already finished in background) ─
             for dl, dest, label in pending_downloads:
                 try:
                     dl.save_as(dest)
@@ -1052,8 +1103,8 @@ class RoundCubeExporter:
                     log.warning("  ✗ Failed to save [%s]: %s", label, exc)
                     self.failed += 1
 
-            # ── Phase 4: close tabs
-            for tab, _msg in tabs_data:
+            # ── Phase 4: close tabs ──────────────────────────────────────────
+            for tab, _label in tabs_data:
                 try:
                     tab.close()
                 except Exception:
