@@ -49,12 +49,16 @@ log = logging.getLogger(__name__)
 # before giving up.  300 000 ms = 5 minutes.
 LOGIN_TIMEOUT_MS = 300_000
 
+# File where user-supplied selector overrides are persisted.
+SELECTORS_FILE = Path("selectors.yaml")
+
 # ---------------------------------------------------------------------------
-# RoundCube CSS selectors
+# RoundCube CSS selectors (defaults)
 # Multiple fallback selectors are joined with commas so Playwright tries each.
-# Adjust these if your RoundCube version uses different class/id names.
+# Adjust these if your RoundCube version uses different class/id names, or
+# let the script prompt you at runtime and save to selectors.yaml.
 # ---------------------------------------------------------------------------
-SELECTORS = {
+DEFAULT_SELECTORS = {
     # ── Message list rows ───────────────────────────────────────────────────
     # RoundCube renders the inbox as a <table id="messagelist"> where every
     # email is a <tr class="message …">.
@@ -145,6 +149,8 @@ class RoundCubeExporter:
         self.start_page = start_page
         self.exported = 0
         self.failed = 0
+        # Selectors: start from defaults, then overlay any saved overrides.
+        self.selectors = self._load_selectors()
 
     # ── Public entry point ──────────────────────────────────────────────────
 
@@ -176,6 +182,12 @@ class RoundCubeExporter:
                     "Finished. Exported: %d  |  Failed: %d",
                     self.exported,
                     self.failed,
+                )
+                input(
+                    "\n"
+                    "  ============================================================\n"
+                    "  Export finished.  Press Enter to close the browser …\n"
+                    "  ============================================================\n"
                 )
                 browser.close()
 
@@ -226,6 +238,59 @@ class RoundCubeExporter:
             "  ============================================================\n"
         )
 
+    # ── Selector persistence ────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_selectors() -> dict:
+        """Return DEFAULT_SELECTORS merged with any overrides from selectors.yaml."""
+        selectors = dict(DEFAULT_SELECTORS)
+        if SELECTORS_FILE.exists():
+            try:
+                with open(SELECTORS_FILE, "r", encoding="utf-8") as fh:
+                    overrides = yaml.safe_load(fh) or {}
+                selectors.update({k: v for k, v in overrides.items() if v})
+                log.info("Loaded selector overrides from %s", SELECTORS_FILE)
+            except Exception as exc:
+                log.warning("Could not read %s: %s", SELECTORS_FILE, exc)
+        return selectors
+
+    def _save_selectors(self):
+        """Persist the current self.selectors dict to selectors.yaml."""
+        try:
+            with open(SELECTORS_FILE, "w", encoding="utf-8") as fh:
+                yaml.dump(self.selectors, fh, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            log.info("Saved updated selectors to %s", SELECTORS_FILE)
+        except Exception as exc:
+            log.warning("Could not save selectors: %s", exc)
+
+    def _ask_for_selector(self, key: str, description: str) -> bool:
+        """Interactively ask the user for a new CSS selector for *key*.
+
+        Prints what was being searched for, shows the current (failed)
+        selector, then waits for the user to type a replacement.  If the
+        user provides one, it is saved to selectors.yaml and True is
+        returned so the caller knows to retry.  Pressing Enter with no
+        input returns False (caller should skip the current item).
+        """
+        print(
+            f"\n"
+            f"  !! Could not find: {description}\n"
+            f"  !! Selector used : {self.selectors[key]}\n"
+            f"\n"
+            f"  Open your browser's DevTools (F12) and inspect the element\n"
+            f"  you want the script to interact with.  Then enter its CSS\n"
+            f"  selector below (e.g. '#myId', '.myClass', 'a[title=\"More\"]').\n"
+            f"  Leave blank and press Enter to skip this element.\n"
+        )
+        new_sel = input(f"  New CSS selector for '{key}': ").strip()
+        if new_sel:
+            self.selectors[key] = new_sel
+            self._save_selectors()
+            log.info("Selector '%s' updated to: %s", key, new_sel)
+            return True
+        log.warning("No selector provided for '%s' – skipping.", key)
+        return False
+
     # ── Navigate to the target mailbox ─────────────────────────────────────
 
     def _go_to_mailbox(self, page):
@@ -247,25 +312,34 @@ class RoundCubeExporter:
 
         while True:
             log.info("━━━ Page %d ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", current_page)
-            rows = page.query_selector_all(SELECTORS["message_rows"])
 
-            if not rows:
-                log.warning("No message rows found on page %d – stopping.", current_page)
-                break
+            # Retry loop: if message rows aren't found, ask for a new selector.
+            while True:
+                rows = page.query_selector_all(self.selectors["message_rows"])
+                if rows:
+                    break
+                log.warning("No message rows found on page %d.", current_page)
+                updated = self._ask_for_selector(
+                    "message_rows",
+                    "message list rows (the individual email rows in the inbox table)",
+                )
+                if not updated:
+                    log.warning("Stopping – no message rows found.")
+                    return
 
             log.info("Found %d message(s)", len(rows))
 
             # Export each message; re-query the DOM after each click because
             # the live NodeList may be invalidated when the view updates.
             for idx in range(len(rows)):
-                rows = page.query_selector_all(SELECTORS["message_rows"])
+                rows = page.query_selector_all(self.selectors["message_rows"])
                 if idx >= len(rows):
                     break
                 self._export_single(page, rows[idx], current_page, idx + 1)
                 time.sleep(self.delay)
 
             # ── Advance to the next page ────────────────────────────────────
-            next_btn = page.query_selector(SELECTORS["next_page"])
+            next_btn = page.query_selector(self.selectors["next_page"])
             if not next_btn:
                 log.info("No 'Next page' button – reached end of mailbox.")
                 break
@@ -299,26 +373,67 @@ class RoundCubeExporter:
         log.info("  → [%s]", label)
 
         try:
-            # 1. Click the message row to select/open it
+            # ── Step 1: Click the message row to select/open it ──────────────
             row.click()
             page.wait_for_load_state("networkidle")
             time.sleep(0.5)
 
-            # 2. Open the "More / ..." toolbar dropdown
-            more_btn = page.wait_for_selector(
-                SELECTORS["more_button"], timeout=10_000
-            )
-            more_btn.click()
-            time.sleep(0.4)
+            # ── Step 2: Open "More / ..." toolbar dropdown (with retry) ──────
+            while True:
+                try:
+                    more_btn = page.wait_for_selector(
+                        self.selectors["more_button"], timeout=10_000
+                    )
+                    more_btn.click()
+                    time.sleep(0.4)
+                    break
+                except PlaywrightTimeoutError:
+                    log.warning("     ✗ 'More' button not found for [%s]", label)
+                    updated = self._ask_for_selector(
+                        "more_button",
+                        "'More / ...' toolbar button (opens a dropdown with the Export option)",
+                    )
+                    if not updated:
+                        log.warning("     ✗ Skipping [%s]", label)
+                        self.failed += 1
+                        return
 
-            # 3. Click "Export" and capture the browser download
-            with page.expect_download(timeout=30_000) as dl_info:
-                export_item = page.wait_for_selector(
-                    SELECTORS["export_item"], timeout=5_000
-                )
-                export_item.click()
+            # ── Step 3: Click "Export" and capture the download (with retry) ─
+            while True:
+                try:
+                    with page.expect_download(timeout=30_000) as dl_info:
+                        export_item = page.wait_for_selector(
+                            self.selectors["export_item"], timeout=5_000
+                        )
+                        export_item.click()
+                    download = dl_info.value
+                    break
+                except PlaywrightTimeoutError:
+                    log.warning("     ✗ 'Export' item not found in dropdown for [%s]", label)
+                    page.keyboard.press("Escape")
+                    time.sleep(0.3)
+                    updated = self._ask_for_selector(
+                        "export_item",
+                        "'Export' menu item inside the 'More' dropdown",
+                    )
+                    if not updated:
+                        log.warning("     ✗ Skipping [%s]", label)
+                        self.failed += 1
+                        return
+                    # Re-open the More dropdown before retrying
+                    try:
+                        more_btn = page.wait_for_selector(
+                            self.selectors["more_button"], timeout=10_000
+                        )
+                        more_btn.click()
+                        time.sleep(0.4)
+                    except PlaywrightTimeoutError:
+                        log.warning(
+                            "     ✗ Could not re-open 'More' dropdown for [%s]", label
+                        )
+                        self.failed += 1
+                        return
 
-            download = dl_info.value
             dest = self.download_dir / f"{label}.eml"
             download.save_as(dest)
             log.info("     ✓ Saved → %s", dest)
