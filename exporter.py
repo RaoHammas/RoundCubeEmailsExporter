@@ -6,11 +6,12 @@ Automates clicking on individual emails in RoundCube webmail,
 clicking the Export button for each one, and navigating through pages.
 Every email is downloaded as a standard .eml file.
 
+The script opens a visible browser window and waits for YOU to log in
+manually.  Once the browser URL contains 'roundcube' (i.e. you have
+reached the RoundCube inbox), the export starts automatically.
+
 Usage (CLI):
-    python exporter.py \\
-        --url      "https://yourserver.com/roundcube/" \\
-        --username "user@example.com" \\
-        --password "yourpassword"
+    python exporter.py --url "https://yourserver.com:2096/"
 
 Usage (config file):
     python exporter.py --config config.yaml
@@ -18,6 +19,7 @@ Usage (config file):
 
 import argparse
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -40,24 +42,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+
+# How long (milliseconds) to wait for the user to complete manual login
+# before giving up.  300 000 ms = 5 minutes.
+LOGIN_TIMEOUT_MS = 300_000
+
+# ---------------------------------------------------------------------------
 # RoundCube CSS selectors
 # Multiple fallback selectors are joined with commas so Playwright tries each.
 # Adjust these if your RoundCube version uses different class/id names.
 # ---------------------------------------------------------------------------
 SELECTORS = {
-    # ── RoundCube login form ────────────────────────────────────────────────
-    "login_user":   "#rcmloginuser",
-    "login_pass":   "#rcmloginpwd",
-    "login_submit": "#rcmloginsubmit",
-
-    # ── cPanel webmail login form (port 2096 / 2095) ───────────────────────
-    "cpanel_user":   "#user",
-    "cpanel_pass":   "#pass",
-    "cpanel_submit": "#login_submit",
-
-    # ── cPanel webmail client selection page (after cPanel login) ──────────
-    "cpanel_roundcube_link": 'a[href*="roundcube"]',
-
     # ── Message list rows ───────────────────────────────────────────────────
     # RoundCube renders the inbox as a <table id="messagelist"> where every
     # email is a <tr class="message …">.
@@ -130,8 +127,8 @@ class RoundCubeExporter:
     def __init__(
         self,
         url: str,
-        username: str,
-        password: str,
+        username: str = "",
+        password: str = "",
         download_dir: str = "./exported_emails",
         mailbox: str = "INBOX",
         headless: bool = False,
@@ -155,15 +152,21 @@ class RoundCubeExporter:
         """Launch the browser and export all emails."""
         self.download_dir.mkdir(parents=True, exist_ok=True)
 
+        if self.headless:
+            log.warning(
+                "Manual login requires a visible browser window – "
+                "ignoring --headless."
+            )
+
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=self.headless)
+            browser = pw.chromium.launch(headless=False)
             context = browser.new_context(
                 accept_downloads=True,
                 viewport={"width": 1400, "height": 900},
             )
             page = context.new_page()
             try:
-                self._login(page)
+                self._wait_for_manual_login(page)
                 self._go_to_mailbox(page)
                 self._export_all_pages(page)
             except Exception as exc:
@@ -176,49 +179,39 @@ class RoundCubeExporter:
                 )
                 browser.close()
 
-    # ── Login ───────────────────────────────────────────────────────────────
+    # ── Manual-login wait ───────────────────────────────────────────────────
 
-    def _login(self, page):
+    def _wait_for_manual_login(self, page):
+        """Open the browser at self.url and wait for the user to log in.
+
+        Export starts only after the browser URL contains 'roundcube',
+        which indicates that the user has successfully authenticated and
+        reached the RoundCube webmail application.  The script waits up
+        to 5 minutes before giving up.
+        """
         log.info("Opening %s", self.url)
         page.goto(self.url, wait_until="networkidle")
 
-        # ── Try cPanel webmail login (port 2096 / 2095) ────────────────────
-        if page.query_selector(SELECTORS["cpanel_user"]):
-            log.info("Detected cPanel webmail login page")
-            log.info("Logging in as '%s' …", self.username)
-            page.fill(SELECTORS["cpanel_user"], self.username)
-            page.fill(SELECTORS["cpanel_pass"], self.password)
-            page.click(SELECTORS["cpanel_submit"])
-            page.wait_for_load_state("networkidle")
-            log.info("cPanel login successful")
+        if "/roundcube" not in page.url.lower():
+            log.info(
+                "==========================================================\n"
+                "  Please log in manually in the browser window.\n"
+                "  Waiting until the URL contains 'roundcube' …\n"
+                "  (timeout: 5 minutes)\n"
+                "=========================================================="
+            )
+            # Wait until the browser URL contains '/roundcube' (case-insensitive).
+            # This fires as soon as the user reaches the RoundCube inbox.
+            page.wait_for_url(
+                re.compile(r"/roundcube", re.IGNORECASE),
+                timeout=LOGIN_TIMEOUT_MS,
+            )
+            log.info("RoundCube detected in URL – starting export …")
 
-            # After cPanel login a webmail-client selection page may appear;
-            # automatically click the RoundCube link if present.
-            rc_link = page.query_selector(SELECTORS["cpanel_roundcube_link"])
-            if rc_link:
-                log.info("Webmail selection page detected – choosing RoundCube …")
-                rc_link.click()
-                page.wait_for_load_state("networkidle")
-
-            # Update base URL to the actual RoundCube location so that
-            # subsequent navigation (e.g. _go_to_mailbox) uses the
-            # correct origin after any cPanel redirects.
-            current = page.url.split("?")[0]
-            self.url = current.rstrip("/")
-            log.info("RoundCube base URL set to %s", self.url)
-
-        # ── Try native RoundCube login ─────────────────────────────────────
-        elif page.query_selector(SELECTORS["login_user"]):
-            log.info("Detected RoundCube login page")
-            log.info("Logging in as '%s' …", self.username)
-            page.fill(SELECTORS["login_user"], self.username)
-            page.fill(SELECTORS["login_pass"], self.password)
-            page.click(SELECTORS["login_submit"])
-            page.wait_for_load_state("networkidle")
-            log.info("Login successful")
-
-        else:
-            log.info("Login form not present – assuming session already active")
+        # Capture the RoundCube base URL (strip query string so that
+        # _go_to_mailbox can append its own parameters).
+        self.url = page.url.split("?")[0].rstrip("/")
+        log.info("RoundCube base URL set to %s", self.url)
 
     # ── Navigate to the target mailbox ─────────────────────────────────────
 
@@ -346,9 +339,9 @@ def _parse_args():
         metavar="FILE",
         help="Path to a YAML config file (see config.example.yaml).",
     )
-    parser.add_argument("--url",      help="RoundCube base URL.")
-    parser.add_argument("--username", help="Login username / email address.")
-    parser.add_argument("--password", help="Login password.")
+    parser.add_argument("--url",      help="URL to open in the browser (e.g. your cPanel webmail URL).")
+    parser.add_argument("--username", help="(Unused – login is manual.) Kept for config-file compatibility.")
+    parser.add_argument("--password", help="(Unused – login is manual.) Kept for config-file compatibility.")
     parser.add_argument(
         "--download-dir",
         default=None,
@@ -391,13 +384,13 @@ def main():
         cfg = load_config(args.config)
 
     url      = args.url          or cfg.get("url")
-    username = args.username     or cfg.get("username")
-    password = args.password     or cfg.get("password")
+    username = args.username     or cfg.get("username", "")
+    password = args.password     or cfg.get("password", "")
 
-    if not url or not username or not password:
+    if not url:
         print(
-            "ERROR: --url, --username, and --password are required.\n"
-            "       Supply them as CLI flags or via a --config YAML file.",
+            "ERROR: --url is required.\n"
+            "       Supply it as a CLI flag or via a --config YAML file.",
             file=sys.stderr,
         )
         sys.exit(1)

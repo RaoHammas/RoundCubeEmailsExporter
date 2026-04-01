@@ -4,10 +4,15 @@
 
 # ── Required ────────────────────────────────────────────────────────────────
 
-# Base URL of your RoundCube installation (include trailing slash)
-url: "https://yourserver.com/roundcube/"
+# URL to open in the browser – can be your cPanel webmail URL (port 2096/2095)
+# or a direct RoundCube URL.  The script waits for you to log in manually,
+# then starts exporting once the URL contains 'roundcube'.
+url: "https://yourserver.com:2096/"
 
-# Your RoundCube login credentials
+# ── Optional (not used for login – kept for reference / future use) ──────────
+
+# Your webmail credentials (login is now manual; these fields are not read by
+# the script but may be kept here for your own reference).
 username: "user@example.com"
 password: "yourpassword"
 

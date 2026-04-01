@@ -6,10 +6,10 @@ A Python + Playwright script that bulk-exports **all emails** from
 RoundCube's UI only provides an "Export" button for **one email at a time**.
 This script automates the entire process:
 
-1. Opens a Chromium browser and logs into your RoundCube instance.
-2. Clicks each email in the message list.
-3. Opens the **More (…) → Export** dropdown item.
-4. Saves the downloaded `.eml` file to a local folder.
+1. Opens a **visible** Chromium browser window at your webmail URL.
+2. Waits for **you to log in manually** in that window.
+3. Once the URL contains `roundcube` (i.e. you have reached the RoundCube inbox), the export starts automatically.
+4. Clicks each email in the message list, opens **More (…) → Export**, and saves the `.eml` file.
 5. Navigates through every page of the mailbox and repeats.
 
 ---
@@ -35,22 +35,12 @@ playwright install chromium
 ### Option A – command-line flags
 
 ```bash
-python exporter.py \
-  --url      "https://yourserver.com/roundcube/" \
-  --username "user@example.com" \
-  --password "yourpassword"
+python exporter.py --url "https://yourserver.com:2096/"
 ```
 
-The `--url` also accepts **cPanel webmail** URLs (port 2096 or 2095).
-The script will automatically log in via cPanel, select RoundCube if a
-webmail-client selection page appears, and then export emails as usual:
-
-```bash
-python exporter.py \
-  --url      "https://yourserver.com:2096" \
-  --username "user@example.com" \
-  --password "yourpassword"
-```
+A browser window will open.  **Log in manually.**  As soon as the URL
+contains `roundcube` (e.g. `…/3rdparty/roundcube/?_task=mail&_mbox=INBOX`),
+the script detects it and begins exporting automatically.
 
 ### Option B – config file
 
@@ -58,7 +48,7 @@ Copy the example config, fill in your details, then run:
 
 ```bash
 cp config.example.yaml config.yaml
-# edit config.yaml with your URL / credentials
+# edit config.yaml – set your webmail URL
 python exporter.py --config config.yaml
 ```
 
@@ -66,9 +56,9 @@ python exporter.py --config config.yaml
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--url` | *(required)* | RoundCube base URL (also works with cPanel webmail URLs on port 2096/2095) |
-| `--username` | *(required)* | Login username / email address |
-| `--password` | *(required)* | Login password |
+| `--url` | *(required)* | URL to open in the browser (cPanel webmail, direct RoundCube, etc.) |
+| `--username` | – | Not used for login (kept for config-file compatibility) |
+| `--password` | – | Not used for login (kept for config-file compatibility) |
 | `--download-dir` | `./exported_emails` | Folder to save `.eml` files |
 | `--mailbox` | `INBOX` | Mailbox/folder to export (`INBOX`, `Sent`, etc.) |
 | `--headless` | off | Run browser with no visible window |
@@ -98,17 +88,18 @@ A log file `exporter.log` is also written in the current directory.
 
 | Symptom | Fix |
 |---------|-----|
-| Export button not found | Run **without** `--headless` to see what the browser sees; adjust the `SELECTORS` dictionary in `exporter.py` to match your RoundCube version. |
+| Browser window doesn't open | Make sure you are **not** running in a headless environment; a display is required for manual login. |
+| Export button not found | Adjust the `SELECTORS` dictionary in `exporter.py` to match your RoundCube version. |
 | Downloads not starting | Make sure your RoundCube session has permission to export; try increasing `--delay`. |
 | Script stops mid-run | Note the last page number in the log and re-run with `--start-page N`. |
-| Login fails | Check your URL ends with `/` and that credentials are correct. |
+| 5-minute login timeout | Log in faster, or increase the `LOGIN_TIMEOUT_MS` constant near the top of `exporter.py`. |
 
 ---
 
 ## How it works
 
 ```
-Login → Navigate to mailbox
+Open browser → wait for manual login (URL must contain 'roundcube')
   └─ For each page:
        ├─ For each email row in the message list:
        │    ├─ Click the row  (opens the message preview)
