@@ -329,6 +329,27 @@ class RoundCubeExporter:
                 # the right folder and the "Show in folder" button works.
                 downloads_path=str(abs_download_dir),
                 viewport={"width": 1400, "height": 900},
+                # ── Anti-bot-detection ──────────────────────────────────────
+                # Remove Chromium's automation flags so the browser passes
+                # hosting-site security checks (e.g. Cloudflare "Checking your
+                # browser…").  Without this, navigator.webdriver === true and
+                # various automation-related Chrome features are visible, which
+                # bot-detection scripts use to block automated browsers.
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_default_args=["--enable-automation"],
+                # A realistic desktop Chrome user-agent (avoids "HeadlessChrome"
+                # strings and keeps the UA consistent with a normal user).
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            # Delete navigator.webdriver before any page JavaScript runs so
+            # that even fingerprinting scripts that read the property directly
+            # cannot detect automation.
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
             page = context.pages[0] if context.pages else context.new_page()
             try:
