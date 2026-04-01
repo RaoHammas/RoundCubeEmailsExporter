@@ -99,8 +99,16 @@ DEFAULT_SELECTORS = {
     ),
 
     # ── "Export" item inside the More dropdown ───────────────────────────────
+    # RoundCube renders toolbar More-menu items as <a class="download …" id="rcmbtnN">.
+    # The "download" class is the stable icon-class for the export action; the
+    # numeric ID (rcmbtnN) changes on every page load and must NOT be used.
+    # Selectors are tried left-to-right; the first match wins.
     "export_item": (
         "a.rcmaction_export, "
+        "#message-menu a.download, "
+        "#toolbar-extra a.download, "
+        ".dropdownmenu a.download, "
+        ".toolbar-menu a.download, "
         "li a[class*='export'], "
         "li a[href*='export'], "
         "a[onclick*='export'], "
@@ -568,22 +576,30 @@ class RoundCubeExporter:
             # buttons.  These numbers change whenever the page reloads, so an
             # ID-based selector breaks on the next run.  Detect this pattern
             # and proactively offer a stable :has-text() alternative.
+            #
+            # We use the picker's own "general" field (tag + stable classes,
+            # with state-classes like "active" already stripped by the JS side)
+            # so the suggestion is as specific as possible, e.g.
+            # "a.download:has-text('Export')" rather than just
+            # "a:has-text('Export')".
             element_id   = picked.get("id") or ""
             element_text = (picked.get("text") or "").strip()
             element_tag  = picked.get("tag") or "a"
+            general_sel  = picked.get("general") or element_tag
             if (
                 element_id
                 and re.search(r"\d", element_id)
                 and element_text
                 and len(element_text) <= 40
             ):
-                text_sel = f'{element_tag}:has-text("{element_text}")'
+                safe_text = element_text.replace('"', '\\"')
+                text_sel = f'{general_sel}:has-text("{safe_text}")'
                 print(
                     f"\n  ⚠  Warning: the ID '{element_id}' contains numbers and is likely\n"
                     f"     dynamically generated – it may change on the next page load.\n"
-                    f"  Stable text-based alternative: {text_sel}\n"
+                    f"  Stable selector alternative: {text_sel}\n"
                 )
-                swap = input("  Switch to the text-based selector? [Y/n]: ").strip().lower()
+                swap = input("  Switch to the stable selector? [Y/n]: ").strip().lower()
                 if swap not in ("n", "no"):
                     sel = text_sel
                     print(f"  → Using: {sel}\n")
@@ -1185,9 +1201,11 @@ class RoundCubeExporter:
                 label,
             )
             try:
+                _btn = EXPORT_BUTTON_TEXT.replace('"', '\\"')
                 loc = tab.locator(
-                    f'a:has-text("{EXPORT_BUTTON_TEXT}"), '
-                    f'button:has-text("{EXPORT_BUTTON_TEXT}")'
+                    f'a.download:has-text("{_btn}"), '
+                    f'a:has-text("{_btn}"), '
+                    f'button:has-text("{_btn}")'
                 )
                 loc.first.wait_for(state="visible", timeout=2_000)
                 export_el = loc.first.element_handle()
@@ -1279,9 +1297,11 @@ class RoundCubeExporter:
                     # Fall back to a text-based search inside the open dropdown.
                     log.warning("     ✗ 'Export' item not found in dropdown for [%s]", label)
                     try:
+                        _btn = EXPORT_BUTTON_TEXT.replace('"', '\\"')
                         loc = page.locator(
-                            f'a:has-text("{EXPORT_BUTTON_TEXT}"), '
-                            f'button:has-text("{EXPORT_BUTTON_TEXT}")'
+                            f'a.download:has-text("{_btn}"), '
+                            f'a:has-text("{_btn}"), '
+                            f'button:has-text("{_btn}")'
                         )
                         loc.first.wait_for(state="visible", timeout=2_000)
                         export_el = loc.first.element_handle()
