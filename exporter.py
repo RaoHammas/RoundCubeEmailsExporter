@@ -920,37 +920,52 @@ class RoundCubeExporter:
         except Exception:
             return ""
 
-    def _collect_page_messages(self, rows, page_num: int) -> list:
-        """Return a list of message-info dicts for every row on the current page.
+    @staticmethod
+    def _get_row_link_url(row, page) -> str:
+        """Return the absolute URL for the message link inside a row.
 
-        Each dict contains:
-          label    – human-readable filename prefix (page / msg / subject)
-          uid      – RoundCube message UID (empty string if unavailable)
-          url      – direct URL to open the message in a new tab (empty if no UID)
-          row_idx  – 0-based index of the row in the ``rows`` list (used for
-                     the serial fallback when no URL is available)
+        RoundCube renders each email row with an ``<a>`` element whose ``href``
+        already contains the correct full path (including any cPanel session
+        token and the ``3rdparty/roundcube/`` prefix):
+
+            /cpsess3472777044/3rdparty/roundcube/?_task=mail&_mbox=INBOX
+            &_uid=473918&_action=show
+
+        We prefer this href over constructing a URL from ``self.url + UID``
+        because the constructed URL lacks the ``3rdparty/roundcube/`` segment
+        and therefore returns a 404 on cPanel webmail installs.
+
+        The href may be relative (starts with ``/``).  In that case we resolve
+        it against the page origin so the returned value is always an absolute
+        URL ready for ``page.goto()`` or ``window.open()``.
         """
-        messages = []
-        for idx, row in enumerate(rows):
-            uid = self._get_row_uid(row)
-            subject = ""
-            subject_el = row.query_selector("td.subject, .subject, span.subject")
-            if subject_el:
-                try:
-                    subject = sanitize_filename(subject_el.inner_text().strip())
-                except Exception:
-                    pass
-            label = f"page{page_num:04d}_msg{idx + 1:04d}"
-            if subject:
-                label = f"{label}_{subject}"
-            url = ""
-            if uid:
-                url = (
-                    f"{self.url}?_task=mail&_action=show"
-                    f"&_uid={uid}&_mbox={urllib.parse.quote(self.mailbox)}"
-                )
-            messages.append({"uid": uid, "label": label, "url": url, "row_idx": idx})
-        return messages
+        try:
+            href = row.evaluate(r"""el => {
+                // prefer the dedicated "show" action link in the subject cell
+                var a = el.querySelector('td.subject a[href*="_action=show"]');
+                if (!a) a = el.querySelector('a[href*="_action=show"]');
+                if (!a) a = el.querySelector('td.subject a[href]');
+                if (!a) a = el.querySelector('a[href]');
+                return a ? (a.getAttribute('href') || '') : '';
+            }""")
+        except Exception:
+            return ""
+
+        href = str(href).strip()
+        if not href:
+            return ""
+
+        # Resolve relative URLs using the current page origin.
+        if href.startswith("//"):
+            parsed = urllib.parse.urlparse(page.url)
+            return f"{parsed.scheme}:{href}"
+        if href.startswith("/"):
+            parsed = urllib.parse.urlparse(page.url)
+            return f"{parsed.scheme}://{parsed.netloc}{href}"
+        if href.startswith("http"):
+            return href
+        # Relative path — unlikely for RoundCube, but handle gracefully.
+        return urllib.parse.urljoin(page.url, href)
 
     def _open_row_in_new_tab(self, page, row, label: str):
         """Open a message row in a new browser tab using native gestures.
@@ -958,39 +973,52 @@ class RoundCubeExporter:
         Three strategies are attempted in order, stopping at the first
         one that successfully produces an open tab:
 
-        1. **Ctrl+click the row** – RoundCube's built-in "Open in New Tab"
-           gesture.  No UID or URL construction required; RoundCube itself
-           builds the correct URL and opens the message just as a human would
-           by pressing Ctrl and clicking.
+        1. **Ctrl+click the subject link** – Ctrl+clicking the ``<a>`` element
+           inside the subject cell is the native browser "Open in New Tab"
+           gesture.  The link's ``href`` is used as-is (it already includes the
+           correct cPanel session token and path), so RoundCube loads the
+           message exactly as it would when the user clicks the link manually.
 
         2. **``window.open(url, '_blank')``** executed from the inbox page –
-           requires a UID but runs inside the browser context of the inbox
-           tab, so all session state and cookies are fully inherited by the
-           new tab.
+           runs inside the browser context of the inbox tab so all session
+           state and cookies are fully inherited by the new tab.
 
         3. **``context.new_page().goto(url)``** – creates a fresh tab and
            navigates directly.  Used only when the first two strategies fail.
 
+        In all URL-based strategies the URL is obtained from
+        :meth:`_get_row_link_url`, which reads the ``href`` directly from the
+        subject anchor instead of constructing a URL that may lack the correct
+        path prefix (see that method's docstring for details).
+
         Returns the Playwright ``Page`` object for the newly opened tab on
         success, or ``None`` when every strategy fails.
         """
-        # ── Strategy 1: Ctrl+click (native RoundCube "Open in New Tab") ─────
+        # ── Strategy 1: Ctrl+click the subject link ──────────────────────────
+        # We click the <a> element specifically, not the whole <tr>.  Clicking
+        # <tr> only opens the message in the inline preview pane; Ctrl+clicking
+        # the anchor triggers a real new-tab navigation via the href.
         try:
-            with self.context.expect_page(timeout=4_000) as page_info:
-                row.click(modifiers=["Control"])
-            tab = page_info.value
-            tab.wait_for_load_state("domcontentloaded", timeout=30_000)
-            return tab
+            link_el = row.query_selector(
+                'td.subject a[href*="_action=show"], '
+                'a[href*="_action=show"], '
+                'td.subject a[href], '
+                'a[href]'
+            )
+            if link_el is not None:
+                with self.context.expect_page(timeout=4_000) as page_info:
+                    link_el.click(modifiers=["Control"])
+                tab = page_info.value
+                tab.wait_for_load_state("domcontentloaded", timeout=30_000)
+                return tab
         except Exception:
             pass
 
-        # ── Strategy 2: window.open() from the inbox page ───────────────────
-        uid = self._get_row_uid(row)
-        if uid:
-            url = (
-                f"{self.url}?_task=mail&_action=show"
-                f"&_uid={uid}&_mbox={urllib.parse.quote(self.mailbox)}"
-            )
+        # ── Resolve the message URL from the row's subject anchor ────────────
+        url = self._get_row_link_url(row, page)
+
+        if url:
+            # ── Strategy 2: window.open() from the inbox page ─────────────────
             try:
                 with self.context.expect_page(timeout=5_000) as page_info:
                     page.evaluate("url => window.open(url, '_blank')", url)
@@ -1001,6 +1029,7 @@ class RoundCubeExporter:
                 pass
 
             # ── Strategy 3: direct new_page().goto() ─────────────────────────
+            tab = None
             try:
                 tab = self.context.new_page()
                 tab.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -1009,10 +1038,11 @@ class RoundCubeExporter:
                 log.warning(
                     "  ✗ All tab-open strategies failed for [%s]: %s", label, exc
                 )
-                try:
-                    tab.close()
-                except Exception:
-                    pass
+                if tab is not None:
+                    try:
+                        tab.close()
+                    except Exception:
+                        pass
 
         return None
 
