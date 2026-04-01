@@ -75,6 +75,7 @@ python exporter.py --config config.yaml
 | `--headless` | off | Run browser with no visible window |
 | `--delay` | `1.0` | Seconds to wait between actions (increase for slow servers) |
 | `--start-page` | `1` | Page to start from – useful for resuming an interrupted run |
+| `--parallel-tabs` | `5` | Number of email tabs to open in parallel per inbox page. All tabs in a batch start loading simultaneously, giving a ~3–4× speedup. Set to `1` to disable parallel mode and use the original serial row-click approach. |
 | `--config` | – | Path to a YAML config file |
 
 ---

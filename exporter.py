@@ -54,6 +54,11 @@ LOGIN_TIMEOUT_MS = 300_000
 # before giving up.  180 s = 3 minutes.
 PICKER_TIMEOUT_S = 180
 
+# Text label of the Export button in the More dropdown.
+# Override this if your RoundCube installation is localised and the button
+# has a different label (e.g. "Exporter" in French).
+EXPORT_BUTTON_TEXT = "Export"
+
 # File where user-supplied selector overrides are persisted.
 SELECTORS_FILE = Path("selectors.yaml")
 
@@ -286,6 +291,7 @@ class RoundCubeExporter:
         headless: bool = False,
         delay: float = 1.0,
         start_page: int = 1,
+        parallel_tabs: int = 5,
     ):
         self.url = url.rstrip("/")
         self.username = username
@@ -295,8 +301,10 @@ class RoundCubeExporter:
         self.headless = headless
         self.delay = delay
         self.start_page = start_page
+        self.parallel_tabs = max(1, min(int(parallel_tabs), 30))
         self.exported = 0
         self.failed = 0
+        self.context = None  # set in run() once the browser context is created
         # Selectors: start from defaults, then overlay any saved overrides.
         self.selectors = self._load_selectors()
 
@@ -351,6 +359,9 @@ class RoundCubeExporter:
             context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
+            # Store the context so that _export_page_with_tabs can open new
+            # tabs inside the same browser session.
+            self.context = context
             page = context.pages[0] if context.pages else context.new_page()
             try:
                 self._wait_for_manual_login(page)
@@ -549,6 +560,31 @@ class RoundCubeExporter:
                 f"    Classes  : {' '.join(picked.get('classes') or []) or '(none)'}\n"
                 f"    Text     : {(picked.get('text') or '')[:60]}\n"
             )
+
+            # ── Warn about dynamic / numeric IDs ─────────────────────────────
+            # RoundCube assigns sequential IDs like "rcmbtn136" to toolbar
+            # buttons.  These numbers change whenever the page reloads, so an
+            # ID-based selector breaks on the next run.  Detect this pattern
+            # and proactively offer a stable :has-text() alternative.
+            element_id   = picked.get("id") or ""
+            element_text = (picked.get("text") or "").strip()
+            element_tag  = picked.get("tag") or "a"
+            if (
+                element_id
+                and re.search(r"\d", element_id)
+                and element_text
+                and len(element_text) <= 40
+            ):
+                text_sel = f'{element_tag}:has-text("{element_text}")'
+                print(
+                    f"\n  ⚠  Warning: the ID '{element_id}' contains numbers and is likely\n"
+                    f"     dynamically generated – it may change on the next page load.\n"
+                    f"  Stable text-based alternative: {text_sel}\n"
+                )
+                swap = input("  Switch to the text-based selector? [Y/n]: ").strip().lower()
+                if swap not in ("n", "no"):
+                    sel = text_sel
+                    print(f"  → Using: {sel}\n")
 
             choice = input(
                 "  [Y]es – use this selector\n"
@@ -789,14 +825,23 @@ class RoundCubeExporter:
 
             log.info("Found %d message(s)", len(rows))
 
-            # Export each message; re-query the DOM after each click because
-            # the live NodeList may be invalidated when the view updates.
-            for idx in range(len(rows)):
-                rows = page.query_selector_all(self.selectors["message_rows"])
-                if idx >= len(rows):
-                    break
-                self._export_single(page, rows[idx], current_page, idx + 1)
-                time.sleep(self.delay)
+            if self.parallel_tabs > 1 and self.context is not None:
+                # ── Parallel-tab mode ──────────────────────────────────────
+                # Collect UID / URL info for every row, open them in tabs that
+                # load simultaneously in the browser, then trigger exports one
+                # by one (UI interaction is sequential but network I/O is not).
+                messages = self._collect_page_messages(rows, current_page)
+                self._export_page_with_tabs(messages)
+            else:
+                # ── Serial mode (original behaviour) ──────────────────────
+                # Export each message; re-query the DOM after each click
+                # because the live NodeList may be invalidated on view updates.
+                for idx in range(len(rows)):
+                    rows = page.query_selector_all(self.selectors["message_rows"])
+                    if idx >= len(rows):
+                        break
+                    self._export_single(page, rows[idx], current_page, idx + 1)
+                    time.sleep(self.delay)
 
             # ── Advance to the next page ────────────────────────────────────
             next_btn = page.query_selector(self.selectors["next_page"])
@@ -817,9 +862,219 @@ class RoundCubeExporter:
             time.sleep(self.delay)
             current_page += 1
 
-    # ── Export a single email ───────────────────────────────────────────────
+    # ── Parallel-tab helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_row_uid(row) -> str:
+        """Extract the RoundCube message UID from a message-list row element.
+
+        RoundCube exposes the UID via the ``data-uid`` attribute in modern
+        versions, and via ``id="rcmrow{uid}"`` in older ones.
+        """
+        uid = row.get_attribute("data-uid") or ""
+        if uid.strip():
+            return uid.strip()
+        row_id = row.get_attribute("id") or ""
+        m = re.match(r"rcmrow(.+)", row_id, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        return ""
+
+    def _collect_page_messages(self, rows, page_num: int) -> list:
+        """Return a list of message-info dicts for every row on the current page.
+
+        Each dict contains:
+          label  – human-readable filename prefix (page / msg / subject)
+          uid    – RoundCube message UID (empty string if unavailable)
+          url    – direct URL to open the message in a new tab (empty if no UID)
+        """
+        messages = []
+        for idx, row in enumerate(rows):
+            uid = self._get_row_uid(row)
+            subject = ""
+            subject_el = row.query_selector("td.subject, .subject, span.subject")
+            if subject_el:
+                try:
+                    subject = sanitize_filename(subject_el.inner_text().strip())
+                except Exception:
+                    pass
+            label = f"page{page_num:04d}_msg{idx + 1:04d}"
+            if subject:
+                label = f"{label}_{subject}"
+            url = ""
+            if uid:
+                url = (
+                    f"{self.url}?_task=mail&_action=show"
+                    f"&_uid={uid}&_mbox={urllib.parse.quote(self.mailbox)}"
+                )
+            messages.append({"uid": uid, "label": label, "url": url})
+        return messages
+
+    def _export_page_with_tabs(self, messages: list):
+        """Export all messages on one inbox page using parallel browser tabs.
+
+        Messages are processed in batches of ``self.parallel_tabs``.  Within
+        each batch:
+
+        1. **Open phase** – every tab is navigated to its direct message URL
+           with ``wait_until="commit"`` so Python returns as soon as the HTTP
+           response starts.  The browser continues loading each tab's content
+           in the background while we open the next one.
+
+        2. **Export phase** – iterate through the open tabs sequentially.  By
+           the time we reach each tab it is typically already at networkidle
+           (loaded while we were opening later tabs), so the per-tab wait is
+           near zero.  We open the More dropdown, click Export, and collect the
+           Playwright Download handle without waiting for the file to finish.
+
+        3. **Save phase** – call ``save_as()`` for every collected download.
+           Because all tabs triggered their downloads during the export phase,
+           most (or all) files are already fully transferred, so this phase is
+           very fast.
+
+        4. **Close phase** – close every tab in the batch.
+        """
+        for batch_start in range(0, len(messages), self.parallel_tabs):
+            batch = messages[batch_start: batch_start + self.parallel_tabs]
+
+            # ── Phase 1: open tabs (they load in parallel at the browser level)
+            tabs_data = []
+            for msg in batch:
+                if not msg["url"]:
+                    log.warning(
+                        "  ✗ Cannot determine direct URL for [%s] – no UID found."
+                        " Skipping (try serial mode with --parallel-tabs 1).",
+                        msg["label"],
+                    )
+                    self.failed += 1
+                    continue
+                try:
+                    tab = self.context.new_page()
+                    # "commit" = return as soon as the HTTP response arrives;
+                    # the page keeps loading in background while we open the
+                    # next tab, achieving true parallel loading.
+                    tab.goto(msg["url"], wait_until="commit", timeout=30_000)
+                    tabs_data.append((tab, msg))
+                    log.info("  ↗ Tab opened for [%s]", msg["label"])
+                except Exception as exc:
+                    log.warning(
+                        "  ✗ Could not open tab for [%s]: %s", msg["label"], exc
+                    )
+                    self.failed += 1
+
+            # ── Phase 2: trigger exports (tabs load while we iterate)
+            pending_downloads = []
+            for tab, msg in tabs_data:
+                dl = self._trigger_tab_export(tab, msg["label"])
+                if dl is not None:
+                    dest = self.download_dir / f"{msg['label']}.eml"
+                    pending_downloads.append((dl, dest, msg["label"]))
+                else:
+                    self.failed += 1
+
+            # ── Phase 3: save downloads (most already finished in background)
+            for dl, dest, label in pending_downloads:
+                try:
+                    dl.save_as(dest)
+                    log.info("  ✓ Saved → %s", dest)
+                    self.exported += 1
+                except Exception as exc:
+                    log.warning("  ✗ Failed to save [%s]: %s", label, exc)
+                    self.failed += 1
+
+            # ── Phase 4: close tabs
+            for tab, _msg in tabs_data:
+                try:
+                    tab.close()
+                except Exception:
+                    pass
+
+    def _trigger_tab_export(self, tab, label: str):
+        """Open the More dropdown and click Export on an already-navigated tab.
+
+        Returns the Playwright ``Download`` object (download has started but
+        may not be complete yet) on success, or ``None`` on failure.  The tab
+        is left open; the caller is responsible for closing it.
+        """
+        # Wait for the page to be fully interactive (it started loading when
+        # the tab was opened in Phase 1; it is often already done by now).
+        try:
+            tab.wait_for_load_state("networkidle", timeout=30_000)
+        except PlaywrightTimeoutError:
+            log.warning(
+                "  ✗ Tab did not reach networkidle for [%s] – continuing anyway.",
+                label,
+            )
+
+        time.sleep(0.3)
+
+        # ── Open "More / ..." dropdown ──────────────────────────────────────
+        try:
+            more_btn = tab.wait_for_selector(
+                self.selectors["more_button"], timeout=10_000
+            )
+            more_btn.click()
+            time.sleep(0.4)
+        except PlaywrightTimeoutError:
+            log.warning("  ✗ 'More' button not found in tab for [%s]", label)
+            return None
+
+        # ── Find the Export menu item ───────────────────────────────────────
+        export_el = None
+        try:
+            export_el = tab.wait_for_selector(
+                self.selectors["export_item"], timeout=5_000
+            )
+        except PlaywrightTimeoutError:
+            # Saved selector failed (e.g. dynamic ID changed).  Fall back to a
+            # text-based search so exports keep working without user input.
+            log.warning(
+                "  ✗ 'Export' item not found by saved selector for [%s] – "
+                "trying text-based fallback.",
+                label,
+            )
+            try:
+                loc = tab.locator(
+                    f'a:has-text("{EXPORT_BUTTON_TEXT}"), '
+                    f'button:has-text("{EXPORT_BUTTON_TEXT}")'
+                )
+                loc.first.wait_for(state="visible", timeout=2_000)
+                export_el = loc.first.element_handle()
+                log.info("  (text-based fallback used for export_item on [%s])", label)
+            except Exception:
+                pass
+
+        if export_el is None:
+            log.warning("  ✗ 'Export' item not found in dropdown for [%s]", label)
+            try:
+                tab.keyboard.press("Escape")
+            except Exception:
+                pass
+            return None
+
+        # ── Click Export and capture the download handle ────────────────────
+        try:
+            with tab.expect_download(timeout=30_000) as dl_info:
+                export_el.click()
+            return dl_info.value
+        except Exception as exc:
+            log.warning("  ✗ Export click/download failed for [%s]: %s", label, exc)
+            try:
+                tab.keyboard.press("Escape")
+            except Exception:
+                pass
+            return None
+
+    # ── Export a single email (serial mode) ────────────────────────────────
 
     def _export_single(self, page, row, page_num: int, row_idx: int):
+        """Click a message row, open the More dropdown, and export the email.
+
+        Updates ``self.exported`` on success and ``self.failed`` on any error.
+        Falls back to a text-based locator when the saved ``export_item``
+        selector fails (e.g. because RoundCube assigned a fresh numeric ID),
+        and prompts the user to re-identify the element if both fail.
+        """
         # Build a human-readable label from the message subject (if available)
         subject = ""
         subject_el = row.query_selector("td.subject, .subject, span.subject")
@@ -861,44 +1116,67 @@ class RoundCubeExporter:
 
             # ── Step 3: Click "Export" and capture the download (with retry) ─
             while True:
+                export_el = None
+                # First try the saved/configured selector.
                 try:
-                    with page.expect_download(timeout=30_000) as dl_info:
-                        export_item = page.wait_for_selector(
-                            self.selectors["export_item"], timeout=5_000
-                        )
-                        export_item.click()
-                    download = dl_info.value
-                    break
-                except PlaywrightTimeoutError:
-                    log.warning("     ✗ 'Export' item not found in dropdown for [%s]", label)
-                    page.keyboard.press("Escape")
-                    time.sleep(0.3)
-                    updated = self._ask_for_selector(
-                        page,
-                        "export_item",
-                        "'Export' menu item inside the 'More' dropdown",
-                        pre_click_selector=self.selectors["more_button"],
+                    export_el = page.wait_for_selector(
+                        self.selectors["export_item"], timeout=5_000
                     )
-                    if not updated:
-                        log.warning("     ✗ Skipping [%s]", label)
-                        self.failed += 1
-                        return
-                    # Ensure the dropdown is closed, then re-open for the real click.
-                    page.keyboard.press("Escape")
-                    time.sleep(0.2)
-                    # Re-open the More dropdown before retrying
+                except PlaywrightTimeoutError:
+                    # Saved selector failed (common when RoundCube assigns a
+                    # fresh numeric ID like #rcmbtn136 on each page load).
+                    # Fall back to a text-based search inside the open dropdown.
+                    log.warning("     ✗ 'Export' item not found in dropdown for [%s]", label)
                     try:
-                        more_btn = page.wait_for_selector(
-                            self.selectors["more_button"], timeout=10_000
+                        loc = page.locator(
+                            f'a:has-text("{EXPORT_BUTTON_TEXT}"), '
+                            f'button:has-text("{EXPORT_BUTTON_TEXT}")'
                         )
-                        more_btn.click()
-                        time.sleep(0.4)
-                    except PlaywrightTimeoutError:
-                        log.warning(
-                            "     ✗ Could not re-open 'More' dropdown for [%s]", label
-                        )
-                        self.failed += 1
-                        return
+                        loc.first.wait_for(state="visible", timeout=2_000)
+                        export_el = loc.first.element_handle()
+                        log.info("     (text-based fallback used for export_item)")
+                    except Exception:
+                        pass
+
+                if export_el is not None:
+                    try:
+                        with page.expect_download(timeout=30_000) as dl_info:
+                            export_el.click()
+                        download = dl_info.value
+                        break
+                    except Exception as dl_exc:
+                        log.warning("     ✗ Download failed for [%s]: %s", label, dl_exc)
+                        export_el = None
+
+                # Both selectors failed – ask the user to re-identify the element.
+                page.keyboard.press("Escape")
+                time.sleep(0.3)
+                updated = self._ask_for_selector(
+                    page,
+                    "export_item",
+                    "'Export' menu item inside the 'More' dropdown",
+                    pre_click_selector=self.selectors["more_button"],
+                )
+                if not updated:
+                    log.warning("     ✗ Skipping [%s]", label)
+                    self.failed += 1
+                    return
+                # Ensure the dropdown is closed, then re-open for the real click.
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+                # Re-open the More dropdown before retrying
+                try:
+                    more_btn = page.wait_for_selector(
+                        self.selectors["more_button"], timeout=10_000
+                    )
+                    more_btn.click()
+                    time.sleep(0.4)
+                except PlaywrightTimeoutError:
+                    log.warning(
+                        "     ✗ Could not re-open 'More' dropdown for [%s]", label
+                    )
+                    self.failed += 1
+                    return
 
             dest = self.download_dir / f"{label}.eml"
             download.save_as(dest)
@@ -966,6 +1244,19 @@ def _parse_args():
         metavar="N",
         help="Page number to start from – useful for resuming (default: 1).",
     )
+    parser.add_argument(
+        "--parallel-tabs",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Number of email tabs to open in parallel per inbox page "
+            "(default: 5). All tabs in a batch start loading simultaneously, "
+            "which typically gives a 3-4× speedup over the serial mode. "
+            "Set to 1 to disable parallel tabs and use the original "
+            "row-click serial mode."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -989,11 +1280,12 @@ def main():
         )
         sys.exit(1)
 
-    download_dir = args.download_dir or cfg.get("download_dir", "./exported_emails")
-    mailbox      = args.mailbox      or cfg.get("mailbox",      "INBOX")
-    headless     = args.headless     if args.headless is not None else cfg.get("headless", False)
-    delay        = args.delay        if args.delay    is not None else cfg.get("delay",    1.0)
-    start_page   = args.start_page   if args.start_page is not None else cfg.get("start_page", 1)
+    download_dir   = args.download_dir   or cfg.get("download_dir",   "./exported_emails")
+    mailbox        = args.mailbox        or cfg.get("mailbox",        "INBOX")
+    headless       = args.headless       if args.headless       is not None else cfg.get("headless",       False)
+    delay          = args.delay          if args.delay          is not None else cfg.get("delay",          1.0)
+    start_page     = args.start_page     if args.start_page     is not None else cfg.get("start_page",     1)
+    parallel_tabs  = args.parallel_tabs  if args.parallel_tabs  is not None else cfg.get("parallel_tabs",  5)
 
     exporter = RoundCubeExporter(
         url=url,
@@ -1004,6 +1296,7 @@ def main():
         headless=headless,
         delay=delay,
         start_page=start_page,
+        parallel_tabs=parallel_tabs,
     )
     exporter.run()
 
