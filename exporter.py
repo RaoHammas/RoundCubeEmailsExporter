@@ -49,6 +49,10 @@ log = logging.getLogger(__name__)
 # before giving up.  300 000 ms = 5 minutes.
 LOGIN_TIMEOUT_MS = 300_000
 
+# How long (seconds) to wait for the user to click an element in the picker
+# before giving up.  180 s = 3 minutes.
+PICKER_TIMEOUT_S = 180
+
 # File where user-supplied selector overrides are persisted.
 SELECTORS_FILE = Path("selectors.yaml")
 
@@ -97,6 +101,139 @@ DEFAULT_SELECTORS = {
         "span.nextpage a"
     ),
 }
+
+# ---------------------------------------------------------------------------
+# Browser-side element picker
+# Injected into the live page; user hovers to inspect, clicks to capture.
+# After one click the picker removes itself and stores the result in
+# window.__rce_picked = { general, path, id, tag, classes, text, title, href }.
+# ---------------------------------------------------------------------------
+PICKER_JS = r"""
+(function () {
+    if (window.__rcePicker) { window.__rcePicker.cleanup(); }
+    window.__rce_picked = null;
+
+    /* ── Tooltip ──────────────────────────────────────────────────────────── */
+    var tip = document.createElement('div');
+    tip.style.cssText = [
+        'position:fixed', 'z-index:2147483647', 'pointer-events:none',
+        'background:#1a1a2e', 'color:#e8e8e8', 'padding:6px 10px',
+        'border-radius:6px', 'font:12px/1.5 monospace', 'max-width:520px',
+        'word-break:break-all', 'box-shadow:0 2px 12px rgba(0,0,0,.65)',
+        'border:2px solid #e74c3c', 'display:none', 'white-space:pre'
+    ].join(';');
+    document.body.appendChild(tip);
+
+    /* ── Banner ───────────────────────────────────────────────────────────── */
+    var banner = document.createElement('div');
+    banner.id = '__rce_banner';
+    banner.style.cssText = [
+        'position:fixed', 'top:0', 'left:0', 'right:0',
+        'z-index:2147483646', 'background:#c0392b', 'color:#fff',
+        'text-align:center', 'padding:8px 16px',
+        'font:bold 13px/1.4 sans-serif', 'letter-spacing:.4px',
+        'pointer-events:none'
+    ].join(';');
+    banner.textContent =
+        '\uD83C\uDFAF ELEMENT PICKER ACTIVE \u2014 hover to inspect \u25b8 click to capture';
+    document.body.appendChild(banner);
+
+    var prev = null, prevOutline = '';
+
+    /* ── CSS selector builders ────────────────────────────────────────────── */
+    /* State-specific classes that should not be part of a stable selector. */
+    var STATE_CLS = /^(unread|read|selected|focused|active|hover|disabled|first|last|odd|even|checked|expanded|collapsed|open|closed)$/i;
+
+    function mkGeneral(el) {
+        var tag = el.tagName.toLowerCase();
+        var cls = Array.from(el.classList).filter(function (c) {
+            return c.trim() && c.length < 40 && !/^\d/.test(c) && !STATE_CLS.test(c);
+        }).slice(0, 4);
+        return tag + (cls.length ? '.' + cls.join('.') : '');
+    }
+
+    function mkPath(el) {
+        var parts = [];
+        var cur = el;
+        while (cur && cur.tagName && cur !== document.documentElement) {
+            if (cur.id) { parts.unshift('#' + cur.id); break; }
+            var part = cur.tagName.toLowerCase();
+            var cls = Array.from(cur.classList).filter(function (c) {
+                return c.trim() && c.length < 40 && !/^\d/.test(c) && !STATE_CLS.test(c);
+            }).slice(0, 3);
+            if (cls.length) part += '.' + cls.join('.');
+            parts.unshift(part);
+            try {
+                if (document.querySelectorAll(parts.join(' > ')).length === 1) break;
+            } catch (e) { /* ignore invalid selector fragments */ }
+            cur = cur.parentElement;
+        }
+        return parts.join(' > ');
+    }
+
+    function onMove(e) {
+        var el = document.elementFromPoint(e.clientX, e.clientY);
+        if (!el || el.id === '__rce_banner') return;
+        if (el !== prev) {
+            if (prev) prev.style.outline = prevOutline;
+            prev = el; prevOutline = el.style.outline || '';
+            el.style.outline = '2px solid #e74c3c';
+        }
+        var gen  = mkGeneral(el);
+        var path = mkPath(el);
+        tip.textContent =
+            'general : ' + gen +
+            '\npath    : ' + path +
+            '\ntag     : ' + el.tagName.toLowerCase() +
+            (el.id        ? '\nid      : ' + el.id        : '') +
+            (el.className ? '\nclasses : ' + el.className : '');
+        tip.style.display = 'block';
+        var x = e.clientX + 16, y = e.clientY + 16;
+        if (x + 530 > window.innerWidth)  x = Math.max(0, e.clientX - 530);
+        if (y + 110 > window.innerHeight) y = Math.max(0, e.clientY - 110);
+        tip.style.left = x + 'px';
+        tip.style.top  = y + 'px';
+    }
+
+    function onClick(e) {
+        var el = document.elementFromPoint(e.clientX, e.clientY);
+        if (!el || el.id === '__rce_banner') return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        window.__rce_picked = {
+            general : mkGeneral(el),
+            path    : mkPath(el),
+            id      : el.id || null,
+            tag     : el.tagName.toLowerCase(),
+            classes : Array.from(el.classList),
+            text    : (el.textContent || '').trim().slice(0, 100),
+            title   : el.getAttribute('title'),
+            href    : el.getAttribute('href')
+        };
+        cleanup();
+    }
+
+    function cleanup() {
+        if (prev) prev.style.outline = prevOutline;
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('click',     onClick, true);
+        if (tip.parentNode)    tip.parentNode.removeChild(tip);
+        if (banner.parentNode) banner.parentNode.removeChild(banner);
+        delete window.__rcePicker;
+    }
+
+    window.__rcePicker = { cleanup: cleanup };
+    document.addEventListener('mousemove', onMove, true);
+    document.addEventListener('click',     onClick, true);
+})();
+"""
+
+_PICKER_CLEANUP_JS = (
+    "(function(){"
+    "  if(window.__rcePicker) window.__rcePicker.cleanup();"
+    "  window.__rce_picked = null;"
+    "})()"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +310,7 @@ class RoundCubeExporter:
             page = context.new_page()
             try:
                 self._wait_for_manual_login(page)
+                self._run_setup_wizard(page)
                 self._go_to_mailbox(page)
                 self._export_all_pages(page)
             except Exception as exc:
@@ -232,9 +370,9 @@ class RoundCubeExporter:
         input(
             "\n"
             "  ============================================================\n"
-            "  Browser is on the RoundCube page.  Make sure the inbox (or\n"
-            "  the folder you want to export) is fully loaded, then press\n"
-            "  Enter here to start the export …\n"
+            "  Browser is on the RoundCube page.  Navigate to the inbox\n"
+            "  (or the folder you want to export) and make sure it is\n"
+            "  fully loaded, then press Enter to verify elements …\n"
             "  ============================================================\n"
         )
 
@@ -263,33 +401,264 @@ class RoundCubeExporter:
         except Exception as exc:
             log.warning("Could not save selectors: %s", exc)
 
-    def _ask_for_selector(self, key: str, description: str) -> bool:
-        """Interactively ask the user for a new CSS selector for *key*.
+    def _ask_for_selector(
+        self,
+        page,
+        key: str,
+        description: str,
+        pre_click_selector: str = "",
+        use_general: bool = False,
+    ) -> bool:
+        """Ask the user to identify an element by clicking it in the browser.
 
-        Prints what was being searched for, shows the current (failed)
-        selector, then waits for the user to type a replacement.  If the
-        user provides one, it is saved to selectors.yaml and True is
-        returned so the caller knows to retry.  Pressing Enter with no
-        input returns False (caller should skip the current item).
+        If *pre_click_selector* is given the script first clicks that element
+        (e.g. to open a dropdown) so the target element is visible before the
+        picker is injected.
+        """
+        if pre_click_selector:
+            try:
+                pre_el = page.wait_for_selector(pre_click_selector, timeout=5_000)
+                pre_el.click()
+                time.sleep(0.5)
+                log.info("Opened '%s' for element picker.", pre_click_selector)
+            except PlaywrightTimeoutError:
+                log.warning("Could not open '%s' before picker.", pre_click_selector)
+        return self._pick_element_by_click(page, key, description, use_general=use_general)
+
+    def _pick_element_by_click(
+        self,
+        page,
+        key: str,
+        description: str,
+        use_general: bool = False,
+    ) -> bool:
+        """Inject a visual hover+click picker and wait for the user to identify
+        an element by clicking it in the browser window.
+
+        A red outline follows the cursor and a tooltip shows the element's
+        CSS selector.  The *first* element the user clicks is captured;
+        ``e.preventDefault()`` ensures the real click action is suppressed.
+
+        Parameters
+        ----------
+        use_general:
+            Use the tag+class selector (no element ID) instead of the
+            ID-anchored path selector.  Pass ``True`` for multi-row selectors
+            like ``message_rows`` where you want to match *all* similar rows.
+        """
+        while True:
+            try:
+                page.evaluate("window.__rce_picked = null;")
+                page.evaluate(PICKER_JS)
+            except Exception as exc:
+                log.warning("Could not inject element picker: %s", exc)
+                return False
+
+            print(
+                f"\n"
+                f"  ╔══════════════════════════════════════════════════════╗\n"
+                f"  ║  🎯  ELEMENT PICKER                                 ║\n"
+                f"  ╠══════════════════════════════════════════════════════╣\n"
+                f"  ║  Identifying: {description[:46]:<46}  ║\n"
+                f"  ╠══════════════════════════════════════════════════════╣\n"
+                f"  ║  In the browser window:                             ║\n"
+                f"  ║    • Hover over elements to see their selector      ║\n"
+                f"  ║    • Click the correct element to capture it        ║\n"
+                f"  ║  Press Ctrl+C here to skip this element.            ║\n"
+                f"  ╚══════════════════════════════════════════════════════╝\n"
+            )
+
+            picked = None
+            try:
+                deadline = time.time() + PICKER_TIMEOUT_S
+                while time.time() < deadline:
+                    result = page.evaluate("window.__rce_picked")
+                    if result:
+                        picked = result
+                        break
+                    time.sleep(0.3)
+            except KeyboardInterrupt:
+                print("\n  (Skipped by user.)\n")
+
+            # Remove the picker overlay regardless of outcome.
+            try:
+                page.evaluate(_PICKER_CLEANUP_JS)
+            except Exception:
+                pass
+
+            if not picked:
+                log.warning("No element picked for '%s'.", key)
+                return False
+
+            sel = (
+                picked.get("general") if use_general else picked.get("path")
+            ) or picked.get("path") or ""
+            if not sel:
+                print("  Could not derive a selector – please try again.")
+                continue
+
+            print(
+                f"\n  Captured:\n"
+                f"    Selector : {sel}\n"
+                f"    Tag      : <{picked.get('tag', '')}>\n"
+                f"    ID       : {picked.get('id') or '(none)'}\n"
+                f"    Classes  : {' '.join(picked.get('classes') or []) or '(none)'}\n"
+                f"    Text     : {(picked.get('text') or '')[:60]}\n"
+            )
+
+            choice = input(
+                "  [Y]es – use this selector\n"
+                "  [N]o  – click a different element\n"
+                "  [E]dit – enter / tweak the selector manually\n"
+                "  Choice [Y/n/e]: "
+            ).strip().lower()
+
+            if choice in ("n", "no"):
+                continue                            # re-inject picker and try again
+            if choice in ("e", "edit"):
+                custom = input(f"  Selector for '{key}': ").strip()
+                if custom:
+                    sel = custom
+
+            self.selectors[key] = sel
+            self._save_selectors()
+            log.info("Selector '%s' updated to: %s", key, sel)
+            return True
+
+    def _run_setup_wizard(self, page):
+        """Check all required CSS selectors before export starts.
+
+        For each of the four required elements the script first tries the
+        current selector (default or previously saved).  Any that cannot be
+        found on the live page trigger the visual picker so the user can click
+        the correct element.  All results are saved to ``selectors.yaml``.
+
+        The wizard navigates the browser through the states needed to expose
+        each element (opening a sample message, opening the More dropdown, …)
+        and ends with a final Enter-to-start prompt.
         """
         print(
-            f"\n"
-            f"  !! Could not find: {description}\n"
-            f"  !! Selector used : {self.selectors[key]}\n"
-            f"\n"
-            f"  Open your browser's DevTools (F12) and inspect the element\n"
-            f"  you want the script to interact with.  Then enter its CSS\n"
-            f"  selector below (e.g. '#myId', '.myClass', 'a[title=\"More\"]').\n"
-            f"  Leave blank and press Enter to skip this element.\n"
+            "\n"
+            "  ════════════════════════════════════════════════════════\n"
+            "  🔍  ELEMENT SETUP CHECK                                \n"
+            "  Verifying required CSS selectors on the current page …  \n"
+            "  ════════════════════════════════════════════════════════"
         )
-        new_sel = input(f"  New CSS selector for '{key}': ").strip()
-        if new_sel:
-            self.selectors[key] = new_sel
-            self._save_selectors()
-            log.info("Selector '%s' updated to: %s", key, new_sel)
-            return True
-        log.warning("No selector provided for '%s' – skipping.", key)
-        return False
+
+        # ── 1. message_rows ─────────────────────────────────────────────────
+        rows = page.query_selector_all(self.selectors["message_rows"])
+        if rows:
+            print(f"  ✓  message rows     – {len(rows)} row(s) found")
+        else:
+            print("  ✗  message rows     – NOT found")
+            print(
+                "\n  Make sure the inbox (or the folder you want to export) is\n"
+                "  fully loaded in the browser, then click any ONE email row.\n"
+            )
+            self._pick_element_by_click(
+                page,
+                "message_rows",
+                "any single email row in the message list",
+                use_general=True,
+            )
+
+        rows = page.query_selector_all(self.selectors["message_rows"])
+
+        # ── Click a sample row so the message toolbar becomes visible ────────
+        if rows:
+            try:
+                rows[0].click()
+                page.wait_for_load_state("networkidle")
+                time.sleep(0.8)
+            except Exception as exc:
+                log.warning("Could not click sample row during setup: %s", exc)
+
+        # ── 2. more_button ────────────────────────────────────────────────────
+        more_el = page.query_selector(self.selectors["more_button"])
+        if more_el:
+            print("  ✓  more button      – found")
+        else:
+            print("  ✗  more button      – NOT found")
+            print(
+                "\n  An email should be selected in the browser.  Please click\n"
+                "  the 'More' or '…' button in the message toolbar.\n"
+            )
+            self._pick_element_by_click(
+                page,
+                "more_button",
+                "the 'More / …' button in the message toolbar",
+            )
+
+        # ── 3. export_item – More dropdown must be open ───────────────────────
+        dropdown_open = False
+        try:
+            more_el2 = page.wait_for_selector(self.selectors["more_button"], timeout=5_000)
+            more_el2.click()
+            time.sleep(0.5)
+            dropdown_open = True
+        except PlaywrightTimeoutError:
+            pass
+
+        export_el = page.query_selector(self.selectors["export_item"])
+        if export_el:
+            print("  ✓  export item      – found")
+            page.keyboard.press("Escape")
+            time.sleep(0.2)
+        else:
+            print("  ✗  export item      – NOT found")
+            if dropdown_open:
+                print(
+                    "\n  The 'More' dropdown is open in the browser.\n"
+                    "  Please click the 'Export' item in the dropdown.\n"
+                )
+            else:
+                print(
+                    "\n  Please open the 'More' dropdown in the toolbar,\n"
+                    "  then click the 'Export' item.\n"
+                )
+            self._pick_element_by_click(
+                page,
+                "export_item",
+                "the 'Export' item inside the 'More' dropdown menu",
+            )
+            page.keyboard.press("Escape")
+            time.sleep(0.2)
+
+        # ── 4. next_page – navigate back to inbox to check pagination ─────────
+        try:
+            page.goto(
+                f"{self.url}?_task=mail&_mbox={self.mailbox}",
+                wait_until="networkidle",
+            )
+            time.sleep(self.delay)
+        except Exception:
+            pass
+
+        next_el = page.query_selector(self.selectors["next_page"])
+        if next_el:
+            print("  ✓  next page button – found")
+        else:
+            print(
+                "  ✗  next page button – NOT found\n"
+                "  (This is fine if the mailbox fits on a single page.)"
+            )
+            print(
+                "\n  If there are multiple pages, please click the 'Next page'\n"
+                "  button in the browser.  Press Ctrl+C to skip.\n"
+            )
+            self._pick_element_by_click(
+                page,
+                "next_page",
+                "the 'Next page' pagination button  (Ctrl+C to skip)",
+            )
+
+        print(
+            "\n"
+            "  ════════════════════════════════════════════════════════\n"
+            "  ✓  Setup complete.  Selectors verified/saved.\n"
+            "  ════════════════════════════════════════════════════════"
+        )
+        input("\n  Press Enter to begin the email export …\n")
 
     # ── Navigate to the target mailbox ─────────────────────────────────────
 
@@ -320,8 +689,10 @@ class RoundCubeExporter:
                     break
                 log.warning("No message rows found on page %d.", current_page)
                 updated = self._ask_for_selector(
+                    page,
                     "message_rows",
                     "message list rows (the individual email rows in the inbox table)",
+                    use_general=True,
                 )
                 if not updated:
                     log.warning("Stopping – no message rows found.")
@@ -390,6 +761,7 @@ class RoundCubeExporter:
                 except PlaywrightTimeoutError:
                     log.warning("     ✗ 'More' button not found for [%s]", label)
                     updated = self._ask_for_selector(
+                        page,
                         "more_button",
                         "'More / ...' toolbar button (opens a dropdown with the Export option)",
                     )
@@ -413,13 +785,18 @@ class RoundCubeExporter:
                     page.keyboard.press("Escape")
                     time.sleep(0.3)
                     updated = self._ask_for_selector(
+                        page,
                         "export_item",
                         "'Export' menu item inside the 'More' dropdown",
+                        pre_click_selector=self.selectors["more_button"],
                     )
                     if not updated:
                         log.warning("     ✗ Skipping [%s]", label)
                         self.failed += 1
                         return
+                    # Ensure the dropdown is closed, then re-open for the real click.
+                    page.keyboard.press("Escape")
+                    time.sleep(0.2)
                     # Re-open the More dropdown before retrying
                     try:
                         more_btn = page.wait_for_selector(
