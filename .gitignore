@@ -19,3 +19,6 @@ env/
 
 # Playwright browser binaries
 .playwright/
+
+# Persistent browser profile (cookies/sessions – contains auth tokens, never commit)
+.browser_profile/

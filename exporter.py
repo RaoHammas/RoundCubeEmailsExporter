@@ -57,6 +57,16 @@ PICKER_TIMEOUT_S = 180
 # File where user-supplied selector overrides are persisted.
 SELECTORS_FILE = Path("selectors.yaml")
 
+# Directory used to store the persistent browser profile (cookies, localStorage,
+# cached sessions).  Using a persistent context means the user only has to log
+# in once; subsequent runs reuse the saved session automatically.
+#
+# ⚠ SECURITY: this directory contains authentication cookies and session tokens.
+#   • It is listed in .gitignore – never commit it to version control.
+#   • Treat it with the same care as a password file.
+#   • Delete it (rm -rf .browser_profile) to force a fresh login.
+PROFILE_DIR = Path(".browser_profile")
+
 # ---------------------------------------------------------------------------
 # RoundCube CSS selectors (defaults)
 # Multiple fallback selectors are joined with commas so Playwright tries each.
@@ -303,12 +313,18 @@ class RoundCubeExporter:
             )
 
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=False)
-            context = browser.new_context(
+            # Use a persistent context so that the browser profile (cookies,
+            # localStorage, cached sessions) is saved to PROFILE_DIR on disk.
+            # This makes the browser appear as a normal (non-incognito) window
+            # and lets the user skip manual login on subsequent runs.
+            PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            context = pw.chromium.launch_persistent_context(
+                str(PROFILE_DIR),
+                headless=False,
                 accept_downloads=True,
                 viewport={"width": 1400, "height": 900},
             )
-            page = context.new_page()
+            page = context.pages[0] if context.pages else context.new_page()
             try:
                 self._wait_for_manual_login(page)
                 self._run_setup_wizard(page)
@@ -328,7 +344,7 @@ class RoundCubeExporter:
                     "  Export finished.  Press Enter to close the browser …\n"
                     "  ============================================================\n"
                 )
-                browser.close()
+                context.close()
 
     # ── Manual-login wait ───────────────────────────────────────────────────
 
